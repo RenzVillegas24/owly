@@ -49,17 +49,24 @@ the phone listed by `peers`; a second `start` returns 5 and adjusts the window;
 ## Supported hardware
 
 What omdrop-owl does on each Wi-Fi driver comes from
-[`userspace/owl-profiles`](userspace/owl-profiles), one line per driver:
+[`userspace/owl-profiles`](userspace/owl-profiles), one line per driver, so the
+`iwlwifi` line covers every Intel card, the untested AX200 too, without the
+opt-in below. In **shared** mode Wi-Fi stays connected; in **exclusive** mode
+it's off while the machine is visible ([why](#exclusive-mode)).
 
-| Driver | Card | Status |
-|---|---|---|
-| `mt7925e` | MediaTek MT7925 (Framework 13) | ✅ Tested: both directions, Wi-Fi stays connected |
-| `iwlwifi` | Intel AX201 | ✅ Tested: both directions on Ubuntu 24.04 (kernel 6.8) and CachyOS (kernel 7.2.9), Wi-Fi is off while visible ([exclusive mode](#exclusive-mode)) |
-| `iwlwifi` | Intel AX200 | ❓ Untested in exclusive mode. Shared mode doesn't work: the driver drops injected frames while connected ([#1](https://github.com/t4t5/omdrop-owl/issues/1)) |
-| `iwlwifi` | Intel AX211 | ✅ Tested: both directions on Ubuntu 26.04 (kernel 7.0), Wi-Fi is off while visible ([exclusive mode](#exclusive-mode)). Shared mode doesn't work ([#4](https://github.com/t4t5/omdrop-owl/issues/4)) |
+| Card | Driver | Status | Tested on |
+|---|---|---|---|
+| MediaTek MT7925 | `mt7925e` | ✅ Shared | Framework 13 |
+| Intel AX201 | `iwlwifi` | ✅ Exclusive | Ubuntu 24.04 (kernel 6.8); CachyOS (kernel 7.2.9) |
+| Intel AX211 | `iwlwifi` | ✅ Exclusive | ThinkPad X1, `8086:51f1`, Ubuntu 26.04 (kernel 7.0) |
+| Intel AX200 | `iwlwifi` | ❓ Exclusive untested | — |
 
-The profile is per driver, so the `iwlwifi` line covers every Intel card: the
-AX200 runs in exclusive mode too, without the opt-in below.
+✅ means both directions work. Shared mode doesn't work on any Intel card
+tried ([#1](https://github.com/t4t5/omdrop-owl/issues/1),
+[#4](https://github.com/t4t5/omdrop-owl/issues/4)). One card name can cover
+chips that behave differently, so a report from a machine, PCI ID
+(`lspci -nn`) or kernel not listed here helps too: run `tools/test-card.sh`
+as below.
 
 Any other card falls back to the table's `*` line, which only runs once you
 opt in with `echo 1 | sudo tee /etc/omdrop/allow-untested`.
