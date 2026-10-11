@@ -22,7 +22,7 @@ the machine is visible ([why](#exclusive-mode)).
 |---|---|---|---|
 | MediaTek MT7925 | `mt7925e` | ✅ Shared | Framework 13, `14c3:0717`, Omarchy 4.0.4 (kernel 7.2.5) |
 | Intel AX201 | `iwlwifi` | ✅ Exclusive | Ubuntu 24.04 (kernel 6.8); CachyOS (kernel 7.2.9) |
-| Intel AX211 | `iwlwifi` | ✅ Exclusive | ThinkPad X1, `8086:51f1`, Ubuntu 26.04 (kernel 7.0) |
+| Intel AX211 | `iwlwifi` | ✅ Exclusive | ThinkPad X1, `8086:51f1`, Ubuntu 26.04 (kernel 7.0); XPS 9320, `8086:51f0`, Arch (kernel 7.2.3) |
 | Intel AX200 | `iwlwifi` | ❓ Exclusive untested | — |
 
 ✅ means both directions work. Shared mode doesn't work on any Intel card
@@ -124,7 +124,9 @@ NetworkManager.
 
 - **An ad-hoc (IBSS) interface joins AWDL's BSSID**, so the firmware ACKs the
   phone's unicast and sees its ACKs, which a monitor interface alone never
-  does.
+  does. Some AX211s refuse a second interface beside the Wi-Fi one, so there
+  the Wi-Fi interface itself becomes the ad-hoc one, and `stop` turns it back
+  and reconnects.
 - **The cell is HT20**, because the iPhone sends at HT rates and ignores us
   until it restarts if we can't ACK them.
 - **It runs on channel 6**: the helper tries 44 and 149 first, but the Intel
