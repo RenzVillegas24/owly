@@ -24,14 +24,26 @@ the machine is visible ([why](#exclusive-mode)).
 | Intel AX201 | `iwlwifi` | ✅ Exclusive | Ubuntu 24.04 (kernel 6.8); CachyOS (kernel 7.2.9) |
 | Intel AX211 | `iwlwifi` | ✅ Exclusive | ThinkPad X1, `8086:51f1`, Ubuntu 26.04 (kernel 7.0); XPS 9320, `8086:51f0`, Arch (kernel 7.2.3) |
 | Intel BE (Panther Lake) | `iwlwifi` | ✅ Exclusive | XPS 16, `8086:e440`, Arch (kernel 7.2) |
+| MediaTek MT7921 | `mt7921e` | ❌ Exclusive ([#14](https://github.com/t4t5/omdrop-owl/issues/14)); shared untested | `14c3:7961`, CachyOS (kernel 7.2.9) |
 | Intel AX200 | `iwlwifi` | ❓ Exclusive untested | — |
+| Intel AX210 | `iwlwifi` | ❓ Exclusive untested | — |
+| Intel BE200 | `iwlwifi` | ❓ Exclusive untested | — |
+| Intel 9260 / 9560 | `iwlwifi` | ❓ Exclusive untested | — |
+| MediaTek MT7922 (RZ616) | `mt7921e` | ❓ Untested (opt-in) | — |
+| Qualcomm WCN6855 (QCNFA765) | `ath11k_pci` | ❓ Untested (opt-in) | — |
+| Qualcomm WCN7850 (FastConnect 7800) | `ath12k` | ❓ Untested (opt-in) | — |
+| Realtek RTL8852BE / RTL8852CE | `rtw89_8852be` / `rtw89_8852ce` | ❓ Untested (opt-in) | — |
+| MediaTek MT7612U (USB) | `mt76x2u` | ❓ Untested (opt-in), in progress in [#13](https://github.com/t4t5/omdrop-owl/pull/13) | — |
 
-✅ means both directions work. Shared mode doesn't work on any Intel card
-tried ([#1](https://github.com/t4t5/omdrop-owl/issues/1),
+✅ means both directions work, ❌ that the mode was tried and fails. Untested
+Intel cards run out of the box; the others need the opt-in described in
+[Adding your card](#adding-your-card). Shared mode doesn't work on any Intel
+card tried ([#1](https://github.com/t4t5/omdrop-owl/issues/1),
 [#4](https://github.com/t4t5/omdrop-owl/issues/4)). One card name can cover
 chips that behave differently, so a report from a machine, PCI ID
 (`lspci -nn`) or kernel not listed here helps too: see
-[Adding your card](#adding-your-card).
+[Adding your card](#adding-your-card). Broadcom cards use
+[omdrop-awdl](https://github.com/brentkearney/omdrop-awdl) instead.
 
 ### Adding your card
 
