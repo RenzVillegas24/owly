@@ -30,7 +30,8 @@ DIR=$ROOT/upstream/owl
 OWL_REPO=https://github.com/jedbillyb/owl.git
 . "$ROOT/pins"
 
-[ -f /usr/include/ev.h ] || { echo "libev headers missing (Arch: sudo pacman -S libev; Debian, Ubuntu: sudo apt install libev-dev)"; exit 1; }
+# Asked of the compiler, not /usr/include: Nix keeps headers elsewhere.
+echo '#include <ev.h>' | "${CC:-cc}" -E -x c - >/dev/null 2>&1 || { echo "libev headers missing (Arch: sudo pacman -S libev; Debian, Ubuntu: sudo apt install libev-dev)"; exit 1; }
 
 if [ ! -d "$DIR/.git" ]; then
   git clone -q --recurse-submodules "$OWL_REPO" "$DIR"
