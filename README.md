@@ -11,7 +11,7 @@ See [supported hardware](#supported-hardware).
 
 Install this package (omdrop-owl) first, then [omdrop](https://github.com/brentkearney/omdrop-plugin).
 
-### On Arch/Omarchy ([AUR](https://aur.archlinux.org/packages/omdrop-owl)):
+On Arch/Omarchy ([AUR](https://aur.archlinux.org/packages/omdrop-owl)):
 
 ```sh
 yay -S omdrop-owl
