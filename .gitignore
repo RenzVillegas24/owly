@@ -14,3 +14,5 @@
 __pycache__
 
 owl-test-*
+# just readme-preview output
+/.readme-preview.html
