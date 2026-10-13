@@ -57,7 +57,7 @@ ADV_INTERVAL=3
 # window, for a whole period of sixteen slots.
 ADV_BURST="--count 3 --interval 0.05"
 ADV_BURST_EXCLUSIVE="--count 64 --interval 0.0164"
-VERSION=0.1.0
+VERSION=0.1.1
 # The omdrop-awdl helper contract this follows, which is also the version of
 # omdrop-awdl's tools staged beside it.
 CONTRACT=0.8.1
