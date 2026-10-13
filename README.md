@@ -35,6 +35,19 @@ unmanaged. It conflicts with `brcmfmac-awdl-dkms`: one radio backend at a time.
 
 </details>
 
+<details>
+<summary>On Fedora (from source)</summary>
+
+```sh
+sudo dnf install rpm-build cmake gcc gcc-c++ make git libev-devel libpcap-devel libnl3-devel
+tools/build-rpm.sh
+sudo dnf install ./omdrop-owl-*.rpm
+```
+
+This builds the same files as the Debian package into an `.rpm` (Fedora package names;
+other rpm-based distros would rename them). `sudo dnf remove omdrop-owl` removes them all.
+</details>
+
 Then install omdrop (0.16.0 or newer):
 
 ```sh
@@ -130,6 +143,10 @@ while the machine is visible and restores it on `stop`.
   frames are sent once to avoid retries stalling the queue.
 
 ## Development
+
+The unit tests (no radio, no root, no network) run with `tools/run-tests.sh`
+and need [`bats`](https://github.com/bats-core/bats-core) and Python. The OWL
+A-MSDU test skips until `just build` has patched OWL.
 
 `just build` assembles the same files in `build/lib`, and `just test` runs the
 card test against them. On Arch, `makepkg -si` (or `just install`) builds and
