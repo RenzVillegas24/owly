@@ -718,6 +718,14 @@ impl Node {
     }
 
     fn same_channel(&self, peer: &Peer, t: Time) -> bool {
+        // A fixed monitor cannot follow the peer's channel sequence. Its
+        // advertised sequence is not a reliable TX gate: the iPhone still
+        // visits our channel for RX, but its sequence can leave our channel
+        // out of most slots, producing multi-second TX holes. Send in the
+        // slots we can and let TCP recover anything the peer missed.
+        if self.fixed() {
+            return true;
+        }
         let slot = self.clock.slot(t);
         let own = self.own_channel(slot);
         let theirs = peer.sequence.map_or(0, |s| s.channel(slot));

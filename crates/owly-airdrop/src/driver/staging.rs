@@ -130,7 +130,7 @@ fn move_unique(from: &Path, dest: &Path, name: &str) -> io::Result<PathBuf> {
     Err(io::Error::new(io::ErrorKind::AlreadyExists, "no free name"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
     renameat2(AT_FDCWD, from, AT_FDCWD, to, RenameFlags::RENAME_NOREPLACE).map_err(io::Error::from)
@@ -138,7 +138,7 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Without an atomic no-replace rename, check first. The race is with the
 /// destination's owner, not with the sender.
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), all(target_os = "linux", not(target_env = "gnu"))))]
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     if std::fs::symlink_metadata(to).is_ok() {
         return Err(io::ErrorKind::AlreadyExists.into());
