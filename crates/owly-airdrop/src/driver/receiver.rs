@@ -108,6 +108,31 @@ pub struct Receiver {
     slots: Arc<Mutex<Slots>>,
 }
 
+/// A handle for aborting one accepted receive while the receiver keeps
+/// listening for new connections.
+#[derive(Clone)]
+pub struct ReceiverControl {
+    slots: Arc<Mutex<Slots>>,
+}
+
+impl ReceiverControl {
+    /// Aborts the connection carrying request `id`. Returns false if that
+    /// request is no longer active.
+    pub fn abort_request(&self, id: u64) -> bool {
+        let mut slots = self.slots.lock().unwrap();
+        let Some(key) = slots.requests.remove(&id) else {
+            return false;
+        };
+        if let Some(slot) = slots.held.get_mut(&key) {
+            if let Some(abort) = slot.abort.take() {
+                abort.abort();
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// The connections being served. When every slot is taken, a new connection
 /// takes the place of the one that has gone longest without finishing a
 /// request, unless that one has an `/Ask` open, so connections that trickle
@@ -116,6 +141,9 @@ pub struct Receiver {
 struct Slots {
     next: u64,
     held: HashMap<u64, Slot>,
+    /// Request id -> connection slot, so an accepted receive can be aborted
+    /// without stopping the receiver.
+    requests: HashMap<u64, u64>,
 }
 
 struct Slot {
@@ -173,11 +201,21 @@ impl Held {
             f(slot);
         }
     }
+
+    fn request(&self, id: u64) {
+        self.slots.lock().unwrap().requests.insert(id, self.key);
+    }
+
+    fn request_done(&self, id: u64) {
+        self.slots.lock().unwrap().requests.remove(&id);
+    }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.slots.lock().unwrap().held.remove(&self.key);
+        let mut slots = self.slots.lock().unwrap();
+        slots.held.remove(&self.key);
+        slots.requests.retain(|_, key| *key != self.key);
     }
 }
 
@@ -204,6 +242,13 @@ impl Receiver {
             },
             rx,
         ))
+    }
+
+    /// A handle for aborting one accepted request without stopping the server.
+    pub fn control(&self) -> ReceiverControl {
+        ReceiverControl {
+            slots: self.slots.clone(),
+        }
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddrV6> {
@@ -335,6 +380,7 @@ impl Task {
                             );
                         }
                         id = self.ids.fetch_add(1, Ordering::Relaxed);
+                        held.request(id);
                         held.update(|s| s.busy = true);
                         let (reply, rx) = oneshot::channel();
                         answer = Some(rx);
@@ -350,6 +396,7 @@ impl Task {
                     }
                     Event::AskWithdrawn => {
                         answer = None;
+                        held.request_done(id);
                         held.update(|s| s.busy = false);
                         let _ = self.events.try_send(ReceiverEvent::Withdrawn { id });
                     }
@@ -384,6 +431,7 @@ impl Task {
                         }
                     }
                     Event::UploadComplete => {
+                        held.request_done(id);
                         held.update(|s| s.busy = false);
                         let result = staging.take().unwrap().finish().await;
                         conn.finish_upload(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
@@ -399,6 +447,7 @@ impl Task {
                     Event::UploadFailed(reason) => {
                         // Dropping staging removes it and everything in it.
                         staging = None;
+                        held.request_done(id);
                         held.update(|s| s.busy = false);
                         let _ = self.events.send(ReceiverEvent::Failed { id, reason }).await;
                     }
