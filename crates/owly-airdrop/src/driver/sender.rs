@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use flate2::Compression;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -114,6 +114,39 @@ impl Sender {
         receiver_flags: u32,
         events: Option<mpsc::UnboundedSender<Event>>,
     ) -> io::Result<Outcome> {
+        self.send_inner(addr, payload, receiver_flags, events, None)
+            .await
+    }
+
+    /// Like [`Sender::send`], but aborts the transfer when `cancel` becomes
+    /// `true`. Cancellation closes the TCP connection abortively so a receiver
+    /// stops reading immediately instead of waiting for its idle timeout.
+    pub async fn send_with_cancel(
+        &self,
+        addr: SocketAddrV6,
+        payload: &Payload,
+        receiver_flags: u32,
+        events: Option<mpsc::UnboundedSender<Event>>,
+        cancel: watch::Receiver<bool>,
+    ) -> io::Result<Outcome> {
+        self.send_inner(
+            addr,
+            payload,
+            receiver_flags,
+            events,
+            Some(cancel),
+        )
+        .await
+    }
+
+    async fn send_inner(
+        &self,
+        addr: SocketAddrV6,
+        payload: &Payload,
+        receiver_flags: u32,
+        events: Option<mpsc::UnboundedSender<Event>>,
+        mut cancel: Option<watch::Receiver<bool>>,
+    ) -> io::Result<Outcome> {
         let compressor = compressor(receiver_flags);
         let (offer, archive) = match payload {
             Payload::Urls(urls) => (Offer::Urls(urls.clone()), None),
@@ -126,12 +159,45 @@ impl Sender {
                 (offer, Some((file, len)))
             }
         };
+        if is_cancelled(&cancel) {
+            return Ok(Outcome::Failed("cancelled".into()));
+        }
         let transfer_id = uuid_v4()?;
         let body = archive.as_ref().map(|(_, len)| (compressor, *len));
         let mut transfer = Transfer::new(&self.config, &transfer_id, &offer, body);
         let mut archive = archive.map(|(file, _)| tokio::fs::File::from_std(file));
 
-        let mut tls = self.connect(addr).await?;
+        let mut tls = tokio::select! {
+            _ = wait_cancel(&mut cancel) => {
+                return Ok(Outcome::Failed("cancelled".into()));
+            }
+            connected = self.connect(addr) => connected?,
+        };
+        let result = self
+            .send_connected(
+                &mut tls,
+                &mut transfer,
+                &mut archive,
+                events.as_ref(),
+                &mut cancel,
+            )
+            .await;
+        if result.is_err() {
+            // A normal outcome closes gracefully in send_connected. An error
+            // may still have a live socket, so make the close abortive.
+            abort_tls(&tls);
+        }
+        result
+    }
+
+    async fn send_connected(
+        &self,
+        tls: &mut TlsStream<TcpStream>,
+        transfer: &mut Transfer,
+        archive: &mut Option<tokio::fs::File>,
+        events: Option<&mpsc::UnboundedSender<Event>>,
+        cancel: &mut Option<watch::Receiver<bool>>,
+    ) -> io::Result<Outcome> {
         let mut buf = vec![0; 16 << 10];
         let mut timer: Option<Instant> = None;
         let mut eof = false;
@@ -140,21 +206,32 @@ impl Sender {
                 match action {
                     Action::Transmit(bytes) => {
                         // Flushed, or tokio-rustls may hold it back.
-                        if let Err(e) = write(&mut tls, &bytes).await {
-                            transfer.receive_eof();
-                            tracing::debug!("write failed: {e}");
+                        match write(tls, &bytes, cancel).await {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                                abort_tls(tls);
+                                return Ok(Outcome::Failed("cancelled".into()));
+                            }
+                            Err(e) => {
+                                transfer.receive_eof();
+                                tracing::debug!("write failed: {e}");
+                            }
                         }
                     }
                     Action::SetTimer(after) => timer = after.map(|d| Instant::now() + d),
                     Action::Accepted => {
-                        if let Some(events) = &events {
+                        if let Some(events) = events {
                             let _ = events.send(Event::Accepted);
                         }
                     }
                     Action::SendUpload(head) => {
                         let file = archive.as_mut().expect("a file share has an archive");
-                        match upload(&mut tls, &head, file, events.as_ref()).await {
+                        match upload(tls, &head, file, events, cancel).await {
                             Ok(()) => transfer.upload_sent(),
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                                abort_tls(tls);
+                                return Ok(Outcome::Failed("cancelled".into()));
+                            }
                             Err(e) => {
                                 // The receiver may have refused and closed;
                                 // its response, if any, says why.
@@ -170,6 +247,10 @@ impl Sender {
                 }
             }
             tokio::select! {
+                _ = wait_cancel(cancel) => {
+                    abort_tls(tls);
+                    return Ok(Outcome::Failed("cancelled".into()));
+                }
                 read = tls.read(&mut buf), if !eof => match read {
                     Ok(0) | Err(_) => {
                         eof = true;
@@ -209,9 +290,10 @@ async fn upload<S: AsyncWriteExt + Unpin>(
     head: &[u8],
     file: &mut tokio::fs::File,
     events: Option<&mpsc::UnboundedSender<Event>>,
+    cancel: &mut Option<watch::Receiver<bool>>,
 ) -> io::Result<()> {
     let total = file.metadata().await?.len();
-    write(stream, head).await?;
+    write(stream, head, cancel).await?;
     let mut buf = vec![0; 64 << 10];
     let mut sent = 0;
     loop {
@@ -219,7 +301,7 @@ async fn upload<S: AsyncWriteExt + Unpin>(
         if n == 0 {
             break;
         }
-        write(stream, &buf[..n]).await?;
+        write(stream, &buf[..n], cancel).await?;
         sent += n as u64;
         if let Some(events) = events {
             let _ = events.send(Event::Progress(Progress { sent, total }));
@@ -228,15 +310,49 @@ async fn upload<S: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Writes and flushes `bytes`, failing if the receiver stalls.
-async fn write<S: AsyncWriteExt + Unpin>(stream: &mut S, bytes: &[u8]) -> io::Result<()> {
+/// Writes and flushes `bytes`, failing if the receiver stalls or the caller
+/// cancels.
+async fn write<S: AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    bytes: &[u8],
+    cancel: &mut Option<watch::Receiver<bool>>,
+) -> io::Result<()> {
+    if is_cancelled(cancel) {
+        return Err(io::Error::from(io::ErrorKind::Interrupted));
+    }
     let written = async {
         stream.write_all(bytes).await?;
         stream.flush().await
     };
-    timeout(WRITE_TIMEOUT, written)
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the receiver stopped reading"))?
+    tokio::select! {
+        _ = wait_cancel(cancel) => Err(io::Error::from(io::ErrorKind::Interrupted)),
+        result = timeout(WRITE_TIMEOUT, written) => {
+            result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the receiver stopped reading"))?
+        }
+    }
+}
+
+fn is_cancelled(cancel: &Option<watch::Receiver<bool>>) -> bool {
+    cancel.as_ref().is_some_and(|rx| *rx.borrow())
+}
+
+async fn wait_cancel(cancel: &mut Option<watch::Receiver<bool>>) {
+    match cancel {
+        Some(rx) => {
+            if *rx.borrow() {
+                return;
+            }
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Abortive close: `SO_LINGER=0` makes the kernel send RST when the stream is
+/// dropped, so the peer stops reading instead of waiting for an idle timeout.
+#[allow(deprecated)] // SO_LINGER=0 is the abortive close we want.
+fn abort_tls(tls: &TlsStream<TcpStream>) {
+    let _ = tls.get_ref().0.set_linger(Some(Duration::ZERO));
 }
 
 /// DVZip unless the receiver's TXT `flags` leave it out. Flags with neither
@@ -459,7 +575,10 @@ mod tests {
         // A pipe nobody reads: the write fills it, then waits.
         let (mut ours, _theirs) = tokio::io::duplex(1024);
         let started = Instant::now();
-        let e = write(&mut ours, &[0; 4096]).await.unwrap_err();
+        let mut cancel = None;
+        let e = write(&mut ours, &[0; 4096], &mut cancel)
+            .await
+            .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         assert_eq!(started.elapsed(), WRITE_TIMEOUT);
     }
