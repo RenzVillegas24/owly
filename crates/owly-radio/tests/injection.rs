@@ -455,6 +455,7 @@ impl Fx {
                 name: "iPhone".into(),
                 devclass: 2,
                 rssi: None,
+                dominant_channel: 0,
             };
             peers.send_replace(vec![phone]);
             let (fail, failed) = watch::channel(None);

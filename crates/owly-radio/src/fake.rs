@@ -100,6 +100,7 @@ impl Fake {
                 name: String::new(),
                 devclass: 0,
                 rssi: None,
+                dominant_channel: 0,
             })
             .collect()
     }
