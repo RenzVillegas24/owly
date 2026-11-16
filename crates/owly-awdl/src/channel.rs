@@ -156,6 +156,21 @@ impl Sequence {
         (out, kept)
     }
 
+    /// The channel among `channels` with the most slots, trying them in
+    /// order for ties; 0 when none has a slot.
+    pub fn best_of(&self, channels: &[Channel]) -> u8 {
+        let mut best = 0u8;
+        let mut best_count = 0usize;
+        for channel in channels {
+            let count = self.count(channel.0);
+            if count > best_count {
+                best = channel.0;
+                best_count = count;
+            }
+        }
+        best
+    }
+
     /// The channel most slots name, with `prefer` winning exact ties; 0
     /// when no slot names one.
     pub fn dominant(&self, prefer: u8) -> u8 {
@@ -306,6 +321,19 @@ mod tests {
         let tie = seq([6, 149, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(tie.dominant(149), 149);
         assert_eq!(Sequence::empty(Encoding::OpClass).dominant(6), 0);
+    }
+
+    #[test]
+    fn best_of_ignores_channels_the_fixed_radio_cannot_use() {
+        let phone = seq([36, 36, 149, 0, 0, 0, 0, 36, 6, 36, 149, 36, 0, 0, 0, 36]);
+        assert_eq!(
+            phone.best_of(&[Channel(149), Channel(44), Channel(6)]),
+            149
+        );
+        assert_eq!(
+            Sequence::empty(Encoding::OpClass).best_of(&[Channel(149), Channel(44), Channel(6)]),
+            0
+        );
     }
 
     #[test]

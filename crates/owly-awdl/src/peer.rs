@@ -2,7 +2,7 @@
 
 use alloc::string::String;
 
-use crate::channel::Sequence;
+use crate::channel::{Channel, Sequence};
 use crate::election::Election;
 use crate::tlv::{Advert, HtCapabilities};
 use crate::{MacAddr, Time};
@@ -43,8 +43,8 @@ pub struct PeerInfo {
     pub name: String,
     pub devclass: u8,
     pub rssi: Option<i8>,
-    /// The channel most slots of the peer's advertised channel sequence
-    /// name, or 0 when no sequence has been heard.
+    /// The best supported AWDL social channel (149, 44, 6) in the peer's
+    /// advertised channel sequence, or 0 when no sequence has been heard.
     pub dominant_channel: u8,
 }
 
@@ -74,7 +74,9 @@ impl Peer {
             name: self.name.clone(),
             devclass: self.devclass,
             rssi: self.rssi,
-            dominant_channel: self.sequence.map_or(0, |s| s.dominant(0)),
+            dominant_channel: self.sequence.map_or(0, |s| {
+                s.best_of(&[Channel(149), Channel(44), Channel(6)])
+            }),
         }
     }
 

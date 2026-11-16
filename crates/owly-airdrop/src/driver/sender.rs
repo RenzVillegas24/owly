@@ -27,7 +27,7 @@ use crate::proto::mdns::{SUPPORTS_DVZIP, SUPPORTS_MIXED_TYPES, SUPPORTS_PIPELINI
 use crate::proto::messages::{AskFile, Offer};
 use crate::proto::sender::{self, Action, Config, Outcome, Receiver, ResponseReader, Transfer};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(10);
 /// A write the receiver doesn't take in this long fails the transfer, so a
 /// receiver that stops reading can't hold the sender forever (SEC-10).
