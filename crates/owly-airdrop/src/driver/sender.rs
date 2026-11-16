@@ -209,7 +209,7 @@ impl Sender {
                         match write(tls, &bytes, cancel).await {
                             Ok(()) => {}
                             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                                abort_tls(tls);
+                                graceful_abort(tls).await;
                                 return Ok(Outcome::Failed("cancelled".into()));
                             }
                             Err(e) => {
@@ -229,7 +229,7 @@ impl Sender {
                         match upload(tls, &head, file, events, cancel).await {
                             Ok(()) => transfer.upload_sent(),
                             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                                abort_tls(tls);
+                                graceful_abort(tls).await;
                                 return Ok(Outcome::Failed("cancelled".into()));
                             }
                             Err(e) => {
@@ -248,7 +248,7 @@ impl Sender {
             }
             tokio::select! {
                 _ = wait_cancel(cancel) => {
-                    abort_tls(tls);
+                    graceful_abort(tls).await;
                     return Ok(Outcome::Failed("cancelled".into()));
                 }
                 read = tls.read(&mut buf), if !eof => match read {
@@ -346,6 +346,17 @@ async fn wait_cancel(cancel: &mut Option<watch::Receiver<bool>>) {
         }
         None => std::future::pending::<()>().await,
     }
+}
+
+/// Close a cancelled transfer. First send a normal TLS/TCP close so the
+/// kernel retransmits the FIN while a fixed-channel peer is off-channel; then
+/// force an abortive close. A bare RST is sent once and is lost when the
+/// iPhone is visiting another AWDL channel, which is why channel 6 cancels
+/// looked successful locally but did not reach the phone.
+async fn graceful_abort(tls: &mut TlsStream<TcpStream>) {
+    let _ = timeout(Duration::from_secs(1), tls.shutdown()).await;
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    abort_tls(tls);
 }
 
 /// Abortive close: `SO_LINGER=0` makes the kernel send RST when the stream is

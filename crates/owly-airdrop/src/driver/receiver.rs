@@ -320,6 +320,15 @@ impl Receiver {
     }
 }
 
+/// Close a cancelled receive. A normal TLS/TCP close is retransmitted while
+/// the sender is off-channel; the final RST is only a fallback. A bare RST is
+/// lost on a fixed 2.4 GHz channel when the iPhone is visiting 5 GHz.
+async fn graceful_abort(tls: &mut tokio_rustls::server::TlsStream<TcpStream>) {
+    let _ = timeout(Duration::from_secs(1), tls.shutdown()).await;
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    abort_tcp(tls);
+}
+
 /// Abortive close: `SO_LINGER=0` makes the kernel send RST when the stream is
 /// dropped, so the sender stops instead of waiting for its idle timeout.
 #[allow(deprecated)] // SO_LINGER=0 is the abortive close we want.
@@ -518,8 +527,8 @@ impl Task {
                 _ = cancel_rx.changed(), if request_active => {
                     held.request_done(id);
                     held.update(|s| s.busy = false);
+                    graceful_abort(&mut tls).await;
                     let _ = self.events.try_send(ReceiverEvent::Aborted { id });
-                    abort_tcp(&tls);
                     return Err(io::Error::from(io::ErrorKind::Interrupted));
                 }
                 read = tls.read(&mut buf), if !eof => {
