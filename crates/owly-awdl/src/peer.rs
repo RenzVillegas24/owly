@@ -43,6 +43,9 @@ pub struct PeerInfo {
     pub name: String,
     pub devclass: u8,
     pub rssi: Option<i8>,
+    /// The channel most slots of the peer's advertised channel sequence
+    /// name, or 0 when no sequence has been heard.
+    pub dominant_channel: u8,
 }
 
 impl Peer {
@@ -71,6 +74,7 @@ impl Peer {
             name: self.name.clone(),
             devclass: self.devclass,
             rssi: self.rssi,
+            dominant_channel: self.sequence.map_or(0, |s| s.dominant(0)),
         }
     }
 
