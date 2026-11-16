@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep_until, timeout};
 use tokio_rustls::TlsAcceptor;
@@ -88,6 +88,13 @@ pub enum ReceiverEvent {
         id: u64,
         urls: Vec<String>,
     },
+    /// Bytes written for the file currently being unpacked. `bytes` is the
+    /// cumulative size of that file, not the whole request.
+    Progress {
+        id: u64,
+        path: PathBuf,
+        bytes: u64,
+    },
     Received {
         id: u64,
         paths: Vec<PathBuf>,
@@ -95,6 +102,11 @@ pub enum ReceiverEvent {
     Failed {
         id: u64,
         reason: String,
+    },
+    /// The frontend aborted this request. The connection has been closed
+    /// abortively and the request will not produce `Received` or `Failed`.
+    Aborted {
+        id: u64,
     },
 }
 
@@ -116,20 +128,14 @@ pub struct ReceiverControl {
 }
 
 impl ReceiverControl {
-    /// Aborts the connection carrying request `id`. Returns false if that
-    /// request is no longer active.
+    /// Asks the connection carrying request `id` to close abortively.
+    /// Returns false if that request is no longer active.
     pub fn abort_request(&self, id: u64) -> bool {
         let mut slots = self.slots.lock().unwrap();
-        let Some(key) = slots.requests.remove(&id) else {
+        let Some(request) = slots.requests.remove(&id) else {
             return false;
         };
-        if let Some(slot) = slots.held.get_mut(&key) {
-            if let Some(abort) = slot.abort.take() {
-                abort.abort();
-                return true;
-            }
-        }
-        false
+        request.cancel.send(true).is_ok()
     }
 }
 
@@ -141,9 +147,14 @@ impl ReceiverControl {
 struct Slots {
     next: u64,
     held: HashMap<u64, Slot>,
-    /// Request id -> connection slot, so an accepted receive can be aborted
-    /// without stopping the receiver.
-    requests: HashMap<u64, u64>,
+    /// Request id -> connection and cancellation handle, so an accepted
+    /// receive can be aborted without stopping the receiver.
+    requests: HashMap<u64, RequestSlot>,
+}
+
+struct RequestSlot {
+    key: u64,
+    cancel: watch::Sender<bool>,
 }
 
 struct Slot {
@@ -202,8 +213,14 @@ impl Held {
         }
     }
 
-    fn request(&self, id: u64) {
-        self.slots.lock().unwrap().requests.insert(id, self.key);
+    fn request(&self, id: u64, cancel: watch::Sender<bool>) {
+        self.slots.lock().unwrap().requests.insert(
+            id,
+            RequestSlot {
+                key: self.key,
+                cancel,
+            },
+        );
     }
 
     fn request_done(&self, id: u64) {
@@ -215,7 +232,7 @@ impl Drop for Held {
     fn drop(&mut self) {
         let mut slots = self.slots.lock().unwrap();
         slots.held.remove(&self.key);
-        slots.requests.retain(|_, key| *key != self.key);
+        slots.requests.retain(|_, request| request.key != self.key);
     }
 }
 
@@ -303,6 +320,13 @@ impl Receiver {
     }
 }
 
+/// Abortive close: `SO_LINGER=0` makes the kernel send RST when the stream is
+/// dropped, so the sender stops instead of waiting for its idle timeout.
+#[allow(deprecated)] // SO_LINGER=0 is the abortive close we want.
+fn abort_tcp(tls: &tokio_rustls::server::TlsStream<TcpStream>) {
+    let _ = tls.get_ref().0.set_linger(Some(Duration::ZERO));
+}
+
 /// The request or status line, for the debug log. The peer's bytes, so
 /// escaped (SEC-4).
 fn first_line(bytes: &[u8]) -> String {
@@ -340,6 +364,12 @@ impl Task {
         let mut staging: Option<Staging> = None;
         let mut id = 0;
         let mut eof = false;
+        // The current upload file and its cumulative bytes, for progress
+        // events. `current_path` is cleared at each file boundary.
+        let mut current_path: Option<PathBuf> = None;
+        let mut current_bytes = 0u64;
+        let mut request_active = false;
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
         // Upload bytes in the current rate window, and when it ends.
         let mut window = (0u64, Instant::now() + RATE_WINDOW);
         loop {
@@ -380,7 +410,10 @@ impl Task {
                             );
                         }
                         id = self.ids.fetch_add(1, Ordering::Relaxed);
-                        held.request(id);
+                        current_path = None;
+                        current_bytes = 0;
+                        request_active = true;
+                        held.request(id, cancel_tx.clone());
                         held.update(|s| s.busy = true);
                         let (reply, rx) = oneshot::channel();
                         answer = Some(rx);
@@ -396,6 +429,7 @@ impl Task {
                     }
                     Event::AskWithdrawn => {
                         answer = None;
+                        request_active = false;
                         held.request_done(id);
                         held.update(|s| s.busy = false);
                         let _ = self.events.try_send(ReceiverEvent::Withdrawn { id });
@@ -419,20 +453,39 @@ impl Task {
                         if let Err(e) = staging.as_mut().unwrap().create_file(&path).await {
                             return self.fail(&mut tls, id, e).await;
                         }
+                        // Only top-level files map cleanly to an offer row.
+                        // A directory's children are covered by aggregate
+                        // progress, not per-file rows the frontend never
+                        // offered.
+                        current_path = (path.components().len() == 1)
+                            .then(|| PathBuf::from(path.last()));
+                        current_bytes = 0;
                     }
                     Event::Data(data) => {
                         if let Err(e) = staging.as_mut().unwrap().write(&data).await {
                             return self.fail(&mut tls, id, e).await;
+                        }
+                        current_bytes = current_bytes.saturating_add(data.len() as u64);
+                        if let Some(path) = &current_path {
+                            let _ = self.events.try_send(ReceiverEvent::Progress {
+                                id,
+                                path: path.clone(),
+                                bytes: current_bytes,
+                            });
                         }
                     }
                     Event::EndFile => {
                         if let Err(e) = staging.as_mut().unwrap().end_file().await {
                             return self.fail(&mut tls, id, e).await;
                         }
+                        current_path = None;
                     }
                     Event::UploadComplete => {
+                        request_active = false;
                         held.request_done(id);
                         held.update(|s| s.busy = false);
+                        current_path = None;
+                        current_bytes = 0;
                         let result = staging.take().unwrap().finish().await;
                         conn.finish_upload(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
                         let event = match result {
@@ -447,6 +500,9 @@ impl Task {
                     Event::UploadFailed(reason) => {
                         // Dropping staging removes it and everything in it.
                         staging = None;
+                        current_path = None;
+                        current_bytes = 0;
+                        request_active = false;
                         held.request_done(id);
                         held.update(|s| s.busy = false);
                         let _ = self.events.send(ReceiverEvent::Failed { id, reason }).await;
@@ -459,6 +515,13 @@ impl Task {
             }
             let prompting = answer.is_some();
             tokio::select! {
+                _ = cancel_rx.changed(), if request_active => {
+                    held.request_done(id);
+                    held.update(|s| s.busy = false);
+                    let _ = self.events.try_send(ReceiverEvent::Aborted { id });
+                    abort_tcp(&tls);
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
                 read = tls.read(&mut buf), if !eof => {
                     match read {
                         Ok(0) => {
@@ -500,6 +563,8 @@ impl Task {
                 () = sleep_until(timer.unwrap_or(idle)), if timer.is_some() => {
                     timer = None;
                     if answer.take().is_some() {
+                        request_active = false;
+                        held.request_done(id);
                         held.update(|s| s.busy = false);
                         let _ = self.events.try_send(ReceiverEvent::Withdrawn { id });
                     }
@@ -513,6 +578,8 @@ impl Task {
                     // A dropped request is a decline.
                     let reply = reply.unwrap_or(Answer::Decline);
                     if reply == Answer::Decline {
+                        request_active = false;
+                        held.request_done(id);
                         held.update(|s| s.busy = false);
                     }
                     conn.answer(reply);
@@ -583,6 +650,25 @@ mod tests {
         }
         assert_eq!(slots.admit(addr(3), 2), None);
         assert_eq!(slots.held.len(), 2);
+    }
+
+    #[test]
+    fn abort_request_signals_only_the_matching_request() {
+        let slots = Arc::new(Mutex::new(Slots::default()));
+        let (cancel, cancelled) = watch::channel(false);
+        slots.lock().unwrap().requests.insert(
+            7,
+            RequestSlot {
+                key: 1,
+                cancel,
+            },
+        );
+        let control = ReceiverControl {
+            slots: Arc::clone(&slots),
+        };
+        assert!(control.abort_request(7));
+        assert!(*cancelled.borrow());
+        assert!(!control.abort_request(7));
     }
 
     // spec: SEC-10

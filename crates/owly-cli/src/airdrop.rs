@@ -682,6 +682,8 @@ async fn run_receiver(
                 }
             }
             ReceiverEvent::Withdrawn { .. } => eprintln!("the request was withdrawn"),
+            ReceiverEvent::Progress { .. } => {}
+            ReceiverEvent::Aborted { .. } => eprintln!("the receive was aborted"),
             // SEC-4: shown, never opened.
             ReceiverEvent::Urls { urls, .. } => {
                 for u in urls {
