@@ -29,6 +29,8 @@ pub const TAP_MTU: u32 = 1500;
 pub const MONITOR_MTU: u32 = 8192;
 /// The most a radiotap header of ours takes.
 const RADIOTAP_MAX: usize = 16;
+/// The K20 WMI management-TX path's maximum frame length.
+const INJECTION_MAX_FRAME: usize = 1532;
 
 /// A running node.
 pub struct Native {
@@ -56,7 +58,10 @@ impl Native {
             .and_then(|m| m.trim().parse::<usize>().ok())
             .unwrap_or(2304);
         let mut cfg = cfg;
-        cfg.max_frame = monitor_mtu.saturating_sub(RADIOTAP_MAX).max(1500);
+        cfg.max_frame = monitor_mtu
+            .saturating_sub(RADIOTAP_MAX)
+            .min(INJECTION_MAX_FRAME)
+            .max(1500);
 
         let air = packet_socket(monitor_index, false)?;
         let tap_fd = open_tap(tap)?;
