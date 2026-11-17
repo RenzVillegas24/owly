@@ -24,7 +24,7 @@ use crate::radiotap;
 use crate::rtnl::Rtnl;
 
 /// `awdl0`'s MTU.
-pub const TAP_MTU: u32 = 1450;
+pub const TAP_MTU: u32 = 1500;
 /// What the monitor interface asks for, so A-MSDUs fit.
 pub const MONITOR_MTU: u32 = 8192;
 /// The most a radiotap header of ours takes.
