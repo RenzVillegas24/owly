@@ -95,6 +95,11 @@ pub enum ReceiverEvent {
         path: PathBuf,
         bytes: u64,
     },
+    /// One top-level file finished unpacking, before the rest of the batch.
+    FileComplete {
+        id: u64,
+        path: PathBuf,
+    },
     Received {
         id: u64,
         paths: Vec<PathBuf>,
@@ -487,7 +492,13 @@ impl Task {
                         if let Err(e) = staging.as_mut().unwrap().end_file().await {
                             return self.fail(&mut tls, id, e).await;
                         }
-                        current_path = None;
+                        if let Some(path) = current_path.take() {
+                            let _ = self.events.try_send(ReceiverEvent::FileComplete {
+                                id,
+                                path,
+                            });
+                        }
+                        current_bytes = 0;
                     }
                     Event::UploadComplete => {
                         request_active = false;

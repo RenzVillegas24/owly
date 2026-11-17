@@ -683,6 +683,7 @@ async fn run_receiver(
             }
             ReceiverEvent::Withdrawn { .. } => eprintln!("the request was withdrawn"),
             ReceiverEvent::Progress { .. } => {}
+            ReceiverEvent::FileComplete { path, .. } => eprintln!("received {}", path.display()),
             ReceiverEvent::Aborted { .. } => eprintln!("the receive was aborted"),
             // SEC-4: shown, never opened.
             ReceiverEvent::Urls { urls, .. } => {
