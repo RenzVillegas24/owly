@@ -185,15 +185,6 @@ impl HtCapabilities {
         rx_mcs: 0xff,
     };
 
-    /// Two spatial streams, MCS 0–15. Experimental: the K20's WCN3990 is
-    /// 2×2, but the monitor RX path has to prove it can decode the second
-    /// stream before this becomes the default.
-    pub const TWO_STREAM: HtCapabilities = HtCapabilities {
-        capabilities: 0x11ce,
-        ampdu_params: 0x1b,
-        rx_mcs: 0xffff,
-    };
-
     /// The mask may be longer than one byte; bits past MCS 31 are
     /// dropped.
     pub fn parse(value: &[u8]) -> Result<HtCapabilities, Error> {

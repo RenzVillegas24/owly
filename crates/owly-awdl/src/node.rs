@@ -165,8 +165,7 @@ pub struct Stats {
 /// Announced in the Version TLV: macOS, as legacy announced.
 const DEVCLASS: u8 = tlv::devclass::MACOS;
 /// What the HT Capabilities TLV announces.
-/// Experimental: advertise both WCN3990 receive streams, not just one.
-const HT: HtCapabilities = HtCapabilities::TWO_STREAM;
+const HT: HtCapabilities = HtCapabilities::ONE_STREAM;
 /// PSFs every 110 TU (§3.2).
 const PSF_INTERVAL_TU: u16 = 110;
 /// Peers unheard for this long are dropped: 5 s, as legacy patch `owl-07`
