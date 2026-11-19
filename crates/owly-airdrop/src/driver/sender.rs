@@ -2,8 +2,10 @@
 //! one fresh TLS connection (HTTP-1), running a
 //! [`proto::sender::Transfer`](crate::proto::sender::Transfer).
 //!
-//! The archive is compressed into a temporary file before the `/Ask`, so the
-//! upload can carry a `Content-Length` like Finder's (UP-1a).
+//! The `/Ask` goes out from metadata alone; the archive is compressed into a
+//! temporary file while the receiver prompts, so a large file does not delay
+//! the prompt. The upload still carries a `Content-Length` like Finder's
+//! (UP-1a), which is why the body is spooled rather than streamed.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
@@ -148,24 +150,36 @@ impl Sender {
         mut cancel: Option<watch::Receiver<bool>>,
     ) -> io::Result<Outcome> {
         let compressor = compressor(receiver_flags);
-        let (offer, archive) = match payload {
+        // The offer is metadata only, so the ask can go out at once. The body
+        // is compressed in the background; the upload waits for it only after
+        // the receiver has accepted.
+        let (offer, mut pending) = match payload {
             Payload::Urls(urls) => (Offer::Urls(urls.clone()), None),
             Payload::Files(paths) => {
+                let offer = offer(paths)?;
+                // Above half a gigabyte, deflating costs more than the radio
+                // will ever get back: store the bytes in the gzip/DVZip
+                // container instead of compressing them.
+                let level = if offer_bytes(&offer) >= 512 << 20 {
+                    Compression::none()
+                } else {
+                    Compression::fast()
+                };
                 let paths = paths.clone();
-                let (offer, file, len) =
-                    tokio::task::spawn_blocking(move || prepare(&paths, compressor))
-                        .await
-                        .map_err(io::Error::other)??;
-                (offer, Some((file, len)))
+                let handle =
+                    tokio::task::spawn_blocking(move || compress(&paths, compressor, level));
+                (offer, Some(handle))
             }
         };
         if is_cancelled(&cancel) {
             return Ok(Outcome::Failed("cancelled".into()));
         }
         let transfer_id = uuid_v4()?;
-        let body = archive.as_ref().map(|(_, len)| (compressor, *len));
+        // A zero length tells the transfer the body isn't ready yet; it asks
+        // for it with `Action::NeedUpload` once the receiver accepts.
+        let body = pending.as_ref().map(|_| (compressor, 0));
         let mut transfer = Transfer::new(&self.config, &transfer_id, &offer, body);
-        let mut archive = archive.map(|(file, _)| tokio::fs::File::from_std(file));
+        let mut archive: Option<tokio::fs::File> = None;
 
         let mut tls = tokio::select! {
             _ = wait_cancel(&mut cancel) => {
@@ -178,6 +192,7 @@ impl Sender {
                 &mut tls,
                 &mut transfer,
                 &mut archive,
+                &mut pending,
                 events.as_ref(),
                 &mut cancel,
             )
@@ -195,6 +210,7 @@ impl Sender {
         tls: &mut TlsStream<TcpStream>,
         transfer: &mut Transfer,
         archive: &mut Option<tokio::fs::File>,
+        pending: &mut Option<tokio::task::JoinHandle<io::Result<(File, u64)>>>,
         events: Option<&mpsc::UnboundedSender<Event>>,
         cancel: &mut Option<watch::Receiver<bool>>,
     ) -> io::Result<Outcome> {
@@ -222,6 +238,26 @@ impl Sender {
                     Action::Accepted => {
                         if let Some(events) = events {
                             let _ = events.send(Event::Accepted);
+                        }
+                    }
+                    Action::NeedUpload => {
+                        let Some(handle) = pending.take() else {
+                            graceful_abort(tls).await;
+                            return Err(io::Error::other("no pending upload body"));
+                        };
+                        match handle.await {
+                            Ok(Ok((file, len))) => {
+                                *archive = Some(tokio::fs::File::from_std(file));
+                                transfer.upload_ready(len);
+                            }
+                            Ok(Err(e)) => {
+                                graceful_abort(tls).await;
+                                return Err(e);
+                            }
+                            Err(e) => {
+                                graceful_abort(tls).await;
+                                return Err(io::Error::other(e));
+                            }
                         }
                     }
                     Action::SendUpload(head) => {
@@ -370,6 +406,14 @@ fn abort_tls(tls: &TlsStream<TcpStream>) {
 /// SupportsPipelining nor SupportsMixedTypes aren't a valid receiver's
 /// (MDNS-5), such as the `0` of an instance whose TXT hasn't arrived, so
 /// they say nothing and get DVZip too (UP-1b).
+/// Total bytes the offer names, for choosing a compression level.
+fn offer_bytes(offer: &Offer) -> u64 {
+    match offer {
+        Offer::Files(files) => files.iter().filter_map(|f| f.size).sum(),
+        Offer::Urls(_) => 0,
+    }
+}
+
 fn compressor(receiver_flags: u32) -> Compressor {
     let known = receiver_flags & (SUPPORTS_PIPELINING | SUPPORTS_MIXED_TYPES) != 0;
     if known && receiver_flags & SUPPORTS_DVZIP == 0 {
@@ -396,9 +440,65 @@ fn uuid_v4() -> io::Result<String> {
     ))
 }
 
-/// Builds the `/Ask` offer for `paths` and compresses their archive into a
-/// temporary file, returning it rewound with its length.
-pub fn prepare(paths: &[PathBuf], compressor: Compressor) -> io::Result<(Offer, File, u64)> {
+/// The `/Ask` offer for `paths`, from metadata only: nothing is read, so the
+/// receiver can prompt while the archive is still being built.
+pub fn offer(paths: &[PathBuf]) -> io::Result<Offer> {
+    let mut names: Vec<String> = Vec::new();
+    let mut files = Vec::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| invalid(format!("{} has no UTF-8 file name", path.display())))?;
+        RelPath::file_name(name).map_err(|e| invalid(e.to_string()))?;
+        if names.iter().any(|n| n == name) {
+            return Err(invalid(format!("two items are called {name}")));
+        }
+        names.push(name.to_string());
+        let meta = std::fs::metadata(path)?;
+        let (size, is_dir) = if meta.is_dir() {
+            (Some(tree_size(path)?), true)
+        } else if meta.is_file() {
+            (Some(meta.len()), false)
+        } else {
+            return Err(invalid(format!(
+                "{} isn't a file or directory",
+                path.display()
+            )));
+        };
+        files.push(AskFile {
+            name: name.to_string(),
+            file_type: sender::uti(name, is_dir).into(),
+            size,
+            bom_path: format!("./{name}"),
+            is_directory: is_dir,
+        });
+    }
+    if files.is_empty() {
+        return Err(invalid("nothing to send".into()));
+    }
+    Ok(Offer::Files(files))
+}
+
+/// The size a directory will carry, from metadata only.
+fn tree_size(path: &Path) -> io::Result<u64> {
+    let meta = std::fs::metadata(path)?;
+    if meta.is_file() {
+        return Ok(meta.len());
+    }
+    let mut total = 0;
+    for entry in std::fs::read_dir(path)? {
+        total += tree_size(&entry?.path())?;
+    }
+    Ok(total)
+}
+
+/// Compresses `paths` into a temporary archive, rewound with its length.
+pub fn compress(
+    paths: &[PathBuf],
+    compressor: Compressor,
+    level: Compression,
+) -> io::Result<(File, u64)> {
     let mut items = Vec::new();
     for path in paths {
         let name = path
@@ -406,9 +506,6 @@ pub fn prepare(paths: &[PathBuf], compressor: Compressor) -> io::Result<(Offer, 
             .and_then(|n| n.to_str())
             .ok_or_else(|| invalid(format!("{} has no UTF-8 file name", path.display())))?;
         RelPath::file_name(name).map_err(|e| invalid(e.to_string()))?;
-        if items.iter().any(|(n, _): &(String, PathBuf)| n == name) {
-            return Err(invalid(format!("two items are called {name}")));
-        }
         items.push((name.to_string(), path.clone()));
     }
     if items.is_empty() {
@@ -417,7 +514,7 @@ pub fn prepare(paths: &[PathBuf], compressor: Compressor) -> io::Result<(Offer, 
 
     let mut spool = tempfile::tempfile()?;
     let mut writer = ArchiveWriter {
-        encoder: Encoder::new(compressor, Compression::fast()),
+        encoder: Encoder::new(compressor, level),
         out: io::BufWriter::new(&mut spool),
         ino: 1,
     };
@@ -426,32 +523,31 @@ pub fn prepare(paths: &[PathBuf], compressor: Compressor) -> io::Result<(Offer, 
         &dir_entry(".", mtime(&std::fs::metadata(&items[0].1)?)),
         None,
     )?;
-    let mut files = Vec::new();
     for (name, path) in &items {
         let meta = std::fs::metadata(path)?;
-        let size = if meta.is_dir() {
-            writer.tree(path, &format!("./{name}"))?
+        if meta.is_dir() {
+            writer.tree(path, &format!("./{name}"))?;
         } else if meta.is_file() {
             writer.file(path, &format!("./{name}"), &meta)?;
-            meta.len()
         } else {
             return Err(invalid(format!(
                 "{} isn't a file or directory",
                 path.display()
             )));
-        };
-        files.push(AskFile {
-            name: name.clone(),
-            file_type: sender::uti(name, meta.is_dir()).into(),
-            size: Some(size),
-            bom_path: format!("./{name}"),
-            is_directory: meta.is_dir(),
-        });
+        }
     }
     writer.finish()?;
     let len = spool.stream_position()?;
     spool.rewind()?;
-    Ok((Offer::Files(files), spool, len))
+    Ok((spool, len))
+}
+
+/// Builds the offer and the archive together. Kept for callers that want the
+/// body before asking.
+pub fn prepare(paths: &[PathBuf], compressor: Compressor) -> io::Result<(Offer, File, u64)> {
+    let offer = offer(paths)?;
+    let (file, len) = compress(paths, compressor, Compression::fast())?;
+    Ok((offer, file, len))
 }
 
 fn invalid(message: String) -> io::Error {

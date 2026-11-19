@@ -301,6 +301,9 @@ pub enum Action {
     SetTimer(Option<Duration>),
     /// The `/Ask` was accepted.
     Accepted,
+    /// The receiver accepted, but the compressed length is not known yet:
+    /// the driver prepares the body and then calls [`Transfer::upload_ready`].
+    NeedUpload,
     /// Send the upload: these head bytes, then the body, then call
     /// [`Transfer::upload_sent`].
     SendUpload(Vec<u8>),
@@ -393,6 +396,17 @@ impl Transfer {
         }
     }
 
+    /// The body is prepared: queue its upload head with the real length.
+    pub fn upload_ready(&mut self, len: u64) {
+        let (compressor, _) = self.upload.expect("a file share has an upload");
+        self.upload = Some((compressor, len));
+        self.actions.push_back(Action::SendUpload(upload_head(
+            &self.transfer_id,
+            compressor,
+            len,
+        )));
+    }
+
     /// The whole upload body has been written.
     pub fn upload_sent(&mut self) {
         if self.state == State::Uploading {
@@ -422,11 +436,17 @@ impl Transfer {
                 } else {
                     let (compressor, len) = self.upload.expect("a file share has an upload");
                     self.state = State::Uploading;
-                    self.actions.push_back(Action::SendUpload(upload_head(
-                        &self.transfer_id,
-                        compressor,
-                        len,
-                    )));
+                    if len == 0 {
+                        // The body is still being prepared; the ask went out
+                        // first so the receiver can prompt while it runs.
+                        self.actions.push_back(Action::NeedUpload);
+                    } else {
+                        self.actions.push_back(Action::SendUpload(upload_head(
+                            &self.transfer_id,
+                            compressor,
+                            len,
+                        )));
+                    }
                 }
             }
             State::Asking => self.finish(Outcome::Declined),
@@ -488,6 +508,25 @@ mod tests {
                 .unwrap();
             assert!(["/Discover", "/Ask", "/Upload"].contains(&head.target.as_str()));
         }
+    }
+
+    #[test]
+    fn a_deferred_body_is_asked_for_after_acceptance() {
+        let config = Config::new("Test", "0123456789ab");
+        // Length 0: the driver is still compressing when the ask goes out.
+        let mut t = Transfer::new(&config, "ID", &file_offer(), Some((Compressor::Gzip, 0)));
+        drain(&mut t);
+        t.receive(&response(
+            200,
+            &plist::to_bytes(&AskResponse::default().to_plist()),
+        ));
+        assert!(matches!(drain(&mut t).last(), Some(Action::NeedUpload)));
+        t.upload_ready(42);
+        let actions = drain(&mut t);
+        let Some(Action::SendUpload(head)) = actions.last() else {
+            panic!("upload head after the body is ready");
+        };
+        assert!(String::from_utf8_lossy(head).contains("Content-Length: 42"));
     }
 
     #[test]
