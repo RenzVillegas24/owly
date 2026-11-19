@@ -85,11 +85,14 @@ impl Peer {
     /// whether it has just turned valid.
     pub(crate) fn absorb(&mut self, a: &Advert, mif: bool) -> bool {
         // The AirDrop name from the service response is the one a user
-        // recognises; the ARPA host name is iOS's UUID. Fall back to ARPA for
-        // peers that never send a service response.
+        // recognises; the ARPA host name is iOS's UUID, and iOS rotates it.
+        // ARPA only fills an unknown name: a later frame without a service
+        // response must not replace the name already learned.
         if let Some(name) = &a.service_name {
             self.name.clone_from(name);
-        } else if let Some(name) = &a.name {
+        } else if self.name.is_empty()
+            && let Some(name) = &a.name
+        {
             self.name.clone_from(name);
         }
         if let Some((version, devclass)) = a.version {
@@ -124,5 +127,39 @@ impl Peer {
         let was = self.valid;
         self.valid = self.mif && self.version != 0 && self.devclass != 0;
         self.valid && !was
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tlv::Advert;
+    use crate::Time;
+
+    #[test]
+    fn a_learned_service_name_survives_a_later_arpa_name() {
+        let mut peer = Peer::new(MacAddr([2, 0, 0, 0, 0, 1]), Time(0));
+
+        let arpa = Advert {
+            name: Some("0b758d4a-bf7f-409e-8cac-9d17ece82229".into()),
+            ..Advert::default()
+        };
+        peer.absorb(&arpa, false);
+        assert_eq!(peer.name, "0b758d4a-bf7f-409e-8cac-9d17ece82229");
+
+        let service = Advert {
+            service_name: Some("RenziPhone".into()),
+            ..Advert::default()
+        };
+        peer.absorb(&service, false);
+        assert_eq!(peer.name, "RenziPhone");
+
+        // iOS rotates its ARPA host name; the display name must stay.
+        let rotated = Advert {
+            name: Some("533497c1-cebc-48a6-8710-b974ba7de924".into()),
+            ..Advert::default()
+        };
+        peer.absorb(&rotated, false);
+        assert_eq!(peer.name, "RenziPhone");
     }
 }
