@@ -396,6 +396,11 @@ impl Transfer {
         }
     }
 
+    /// Bytes the upload body will carry, once known.
+    pub fn upload_size(&self) -> u64 {
+        self.upload.map_or(0, |(_, len)| len)
+    }
+
     /// The body is prepared: queue its upload head with the real length.
     pub fn upload_ready(&mut self, len: u64) {
         let (compressor, _) = self.upload.expect("a file share has an upload");

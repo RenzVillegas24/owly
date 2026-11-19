@@ -22,7 +22,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use super::tls::{self, Identity};
-use crate::proto::archive::compress::{Compressor, Encoder};
+use crate::proto::archive::compress::{Compressor, DVZIP_PIECE, Encoder};
 use crate::proto::archive::cpio::{self, Entry};
 use crate::proto::archive::extract::RelPath;
 use crate::proto::mdns::{SUPPORTS_DVZIP, SUPPORTS_MIXED_TYPES, SUPPORTS_PIPELINING};
@@ -153,33 +153,44 @@ impl Sender {
         // The offer is metadata only, so the ask can go out at once. The body
         // is compressed in the background; the upload waits for it only after
         // the receiver has accepted.
-        let (offer, mut pending) = match payload {
-            Payload::Urls(urls) => (Offer::Urls(urls.clone()), None),
+        let (offer, mut pending, mut stream) = match payload {
+            Payload::Urls(urls) => (Offer::Urls(urls.clone()), None, None),
             Payload::Files(paths) => {
                 let offer = offer(paths)?;
                 // Above half a gigabyte, deflating costs more than the radio
-                // will ever get back: store the bytes in the gzip/DVZip
-                // container instead of compressing them.
-                let level = if offer_bytes(&offer) >= 512 << 20 {
-                    Compression::none()
+                // will ever get back. Store the bytes and stream the archive
+                // straight from the files: no temporary file, and the upload
+                // starts as soon as the receiver accepts.
+                if offer_bytes(&offer) >= STORED_BODY_MIN {
+                    let cpio = cpio_len(paths)?;
+                    let len = stored_body_len(compressor, cpio);
+                    let reader = spawn_stored_body(paths.clone(), compressor)?;
+                    (offer, None, Some((reader, len)))
                 } else {
-                    Compression::fast()
-                };
-                let paths = paths.clone();
-                let handle =
-                    tokio::task::spawn_blocking(move || compress(&paths, compressor, level));
-                (offer, Some(handle))
+                    let paths = paths.clone();
+                    let handle = tokio::task::spawn_blocking(move || {
+                        compress(&paths, compressor, Compression::fast())
+                    });
+                    (offer, Some(handle), None)
+                }
             }
         };
         if is_cancelled(&cancel) {
             return Ok(Outcome::Failed("cancelled".into()));
         }
         let transfer_id = uuid_v4()?;
-        // A zero length tells the transfer the body isn't ready yet; it asks
-        // for it with `Action::NeedUpload` once the receiver accepts.
-        let body = pending.as_ref().map(|_| (compressor, 0));
+        // A streamed body knows its length; a compressed one is still being
+        // prepared, so a zero length asks the transfer for it with
+        // `Action::NeedUpload` once the receiver accepts.
+        let body = match &stream {
+            Some((_, len)) => Some((compressor, *len)),
+            None => pending.as_ref().map(|_| (compressor, 0)),
+        };
         let mut transfer = Transfer::new(&self.config, &transfer_id, &offer, body);
-        let mut archive: Option<tokio::fs::File> = None;
+        let mut archive = match stream.take() {
+            Some((reader, _)) => Some(Body::Stream(tokio::net::UnixStream::from_std(reader)?)),
+            None => None,
+        };
 
         let mut tls = tokio::select! {
             _ = wait_cancel(&mut cancel) => {
@@ -209,7 +220,7 @@ impl Sender {
         &self,
         tls: &mut TlsStream<TcpStream>,
         transfer: &mut Transfer,
-        archive: &mut Option<tokio::fs::File>,
+        archive: &mut Option<Body>,
         pending: &mut Option<tokio::task::JoinHandle<io::Result<(File, u64)>>>,
         events: Option<&mpsc::UnboundedSender<Event>>,
         cancel: &mut Option<watch::Receiver<bool>>,
@@ -247,7 +258,7 @@ impl Sender {
                         };
                         match handle.await {
                             Ok(Ok((file, len))) => {
-                                *archive = Some(tokio::fs::File::from_std(file));
+                                *archive = Some(Body::File(tokio::fs::File::from_std(file)));
                                 transfer.upload_ready(len);
                             }
                             Ok(Err(e)) => {
@@ -261,8 +272,9 @@ impl Sender {
                         }
                     }
                     Action::SendUpload(head) => {
-                        let file = archive.as_mut().expect("a file share has an archive");
-                        match upload(tls, &head, file, events, cancel).await {
+                        let body = archive.as_mut().expect("a file share has an archive");
+                        let total = transfer.upload_size();
+                        match upload(tls, &head, body, total, events, cancel).await {
                             Ok(()) => transfer.upload_sent(),
                             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                                 graceful_abort(tls).await;
@@ -321,19 +333,34 @@ async fn read_response<S: AsyncReadExt + Unpin>(stream: &mut S) -> io::Result<se
     }
 }
 
+/// The upload body: a spooled file, or an archive streamed from the sources.
+enum Body {
+    File(tokio::fs::File),
+    Stream(tokio::net::UnixStream),
+}
+
+impl Body {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Body::File(file) => file.read(buf).await,
+            Body::Stream(stream) => stream.read(buf).await,
+        }
+    }
+}
+
 async fn upload<S: AsyncWriteExt + Unpin>(
     stream: &mut S,
     head: &[u8],
-    file: &mut tokio::fs::File,
+    body: &mut Body,
+    total: u64,
     events: Option<&mpsc::UnboundedSender<Event>>,
     cancel: &mut Option<watch::Receiver<bool>>,
 ) -> io::Result<()> {
-    let total = file.metadata().await?.len();
     write(stream, head, cancel).await?;
     let mut buf = vec![0; 64 << 10];
-    let mut sent = 0;
+    let mut sent = 0u64;
     loop {
-        let n = file.read(&mut buf).await?;
+        let n = body.read(&mut buf).await?;
         if n == 0 {
             break;
         }
@@ -342,6 +369,11 @@ async fn upload<S: AsyncWriteExt + Unpin>(
         if let Some(events) = events {
             let _ = events.send(Event::Progress(Progress { sent, total }));
         }
+    }
+    if sent != total {
+        return Err(io::Error::other(format!(
+            "the body ended at {sent} of {total} bytes"
+        )));
     }
     Ok(())
 }
@@ -413,6 +445,10 @@ fn offer_bytes(offer: &Offer) -> u64 {
         Offer::Urls(_) => 0,
     }
 }
+
+/// Above this, the archive is stored and streamed instead of compressed into
+/// a temporary file.
+const STORED_BODY_MIN: u64 = 512 << 20;
 
 fn compressor(receiver_flags: u32) -> Compressor {
     let known = receiver_flags & (SUPPORTS_PIPELINING | SUPPORTS_MIXED_TYPES) != 0;
@@ -676,6 +712,56 @@ impl<W: Write> ArchiveWriter<W> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_stored_body_is_exactly_the_length_it_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, size) in [
+            ("a", 0usize),
+            ("b", 1),
+            ("c", 65_535),
+            ("d", 65_536),
+            ("e", 70_000),
+        ] {
+            std::fs::write(dir.path().join(name), vec![7u8; size]).unwrap();
+        }
+        let paths = vec![dir.path().to_path_buf()];
+        let cpio = cpio_len(&paths).unwrap();
+
+        for compressor in [Compressor::DvZip, Compressor::Gzip] {
+            // The streamed body: read it out with a patience for the
+            // non-blocking fd the sender hands to tokio.
+            let mut reader = spawn_stored_body(paths.clone(), compressor).unwrap();
+            let mut body = Vec::new();
+            let mut buf = [0u8; 64 << 10];
+            loop {
+                match std::io::Read::read(&mut reader, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => body.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            assert_eq!(
+                body.len() as u64,
+                stored_body_len(compressor, cpio),
+                "{compressor:?} length"
+            );
+            let streamed = crate::proto::archive::compress::tests::decode_all(compressor, &body)
+                .expect("the receiver decodes the streamed body");
+
+            // The same tree, spooled by the old path.
+            let (file, _) = compress(&paths, compressor, Compression::none()).unwrap();
+            let mut spooled = Vec::new();
+            let mut file = file;
+            std::io::Read::read_to_end(&mut file, &mut spooled).unwrap();
+            let spooled = crate::proto::archive::compress::tests::decode_all(compressor, &spooled)
+                .expect("the receiver decodes the spooled body");
+            assert_eq!(streamed, spooled, "{compressor:?} cpio");
+        }
+    }
+
     // spec: SEC-10
     #[tokio::test(start_paused = true)]
     async fn a_receiver_that_stops_reading_fails_the_upload() {
@@ -700,4 +786,343 @@ mod tests {
         assert_eq!(compressor(0), Compressor::DvZip);
         assert_eq!(compressor(0x001), Compressor::DvZip);
     }
+}
+
+/// Bytes of the raw odc archive `paths` produces, matching [`ArchiveWriter`]
+/// entry for entry: 76-byte headers, names, then the data unpadded.
+fn cpio_len(paths: &[PathBuf]) -> io::Result<u64> {
+    if paths.is_empty() {
+        return Err(invalid("nothing to send".into()));
+    }
+    let mut ino = 1u32;
+    let mut total = 0u64;
+    let mut root = dir_entry(".", mtime(&std::fs::metadata(&paths[0])?));
+    root.ino = ino;
+    ino += 1;
+    total += cpio::odc_header(&root).len() as u64;
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| invalid(format!("{} has no UTF-8 file name", path.display())))?;
+        RelPath::file_name(name).map_err(|e| invalid(e.to_string()))?;
+        let meta = std::fs::metadata(path)?;
+        if meta.is_dir() {
+            total += tree_len(path, &format!("./{name}"), &mut ino)?;
+        } else if meta.is_file() {
+            let mut entry = file_entry(name, meta.len(), 0, mtime(&meta));
+            entry.name = format!("./{name}");
+            entry.ino = ino;
+            ino += 1;
+            total += cpio::odc_header(&entry).len() as u64 + meta.len();
+        } else {
+            return Err(invalid(format!(
+                "{} isn't a file or directory",
+                path.display()
+            )));
+        }
+    }
+    total += cpio::odc_trailer().len() as u64;
+    Ok(total)
+}
+
+fn tree_len(path: &Path, name: &str, ino: &mut u32) -> io::Result<u64> {
+    let mut total = 0u64;
+    let mut entry = dir_entry(name, mtime(&std::fs::metadata(path)?));
+    entry.ino = *ino;
+    *ino += 1;
+    total += cpio::odc_header(&entry).len() as u64;
+    let mut children: Vec<_> = std::fs::read_dir(path)?.collect::<Result<_, _>>()?;
+    children.sort_by_key(|c| c.file_name());
+    for child in children {
+        let Some(child_name) = child.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        if RelPath::file_name(&child_name).is_err() {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(child.path())?;
+        let child_path = format!("{name}/{child_name}");
+        if meta.is_dir() {
+            total += tree_len(&child.path(), &child_path, ino)?;
+        } else if meta.is_file() {
+            let mut entry = file_entry(&child_path, meta.len(), 0, mtime(&meta));
+            entry.ino = *ino;
+            *ino += 1;
+            total += cpio::odc_header(&entry).len() as u64 + meta.len();
+        }
+    }
+    Ok(total)
+}
+
+/// Stored deflate blocks: five bytes each, at most 65535 bytes of data.
+fn stored_deflate_len(n: u64) -> u64 {
+    n + 5 * (n / 65_535 + 1)
+}
+
+fn zlib_stored_len(n: u64) -> u64 {
+    2 + stored_deflate_len(n) + 4
+}
+
+fn gzip_stored_len(n: u64) -> u64 {
+    10 + stored_deflate_len(n) + 8
+}
+
+/// Length of the stored body for `cpio` bytes: DVZip chunks of 64 KiB, each a
+/// length and its own zlib stream, or one gzip stream.
+fn stored_body_len(compressor: Compressor, cpio: u64) -> u64 {
+    match compressor {
+        Compressor::DvZip => {
+            let full = cpio / DVZIP_PIECE as u64;
+            let rest = cpio % DVZIP_PIECE as u64;
+            full * (4 + zlib_stored_len(DVZIP_PIECE as u64))
+                + if rest > 0 { 4 + zlib_stored_len(rest) } else { 0 }
+        }
+        Compressor::Gzip => gzip_stored_len(cpio),
+    }
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in data {
+        a = (a + byte as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    (b << 16) | a
+}
+
+fn write_stored_block<W: Write>(out: &mut W, data: &[u8], last: bool) -> io::Result<()> {
+    let n = data.len() as u16;
+    let flag = if last { 1 } else { 0 };
+    out.write_all(&[flag, n as u8, (n >> 8) as u8, !n as u8, (!n >> 8) as u8])?;
+    out.write_all(data)
+}
+
+/// A zlib stream with stored blocks, for one DVZip chunk.
+fn write_zlib_stored<W: Write>(out: &mut W, data: &[u8]) -> io::Result<()> {
+    out.write_all(&[0x78, 0x01])?;
+    let mut left = data;
+    loop {
+        let n = left.len().min(65_535);
+        write_stored_block(out, &left[..n], n == left.len())?;
+        left = &left[n..];
+        if left.is_empty() {
+            break;
+        }
+    }
+    out.write_all(&adler32(data).to_be_bytes())
+}
+
+struct DvZipStore<W: Write> {
+    out: W,
+    piece: Vec<u8>,
+}
+
+impl<W: Write> DvZipStore<W> {
+    fn new(out: W) -> Self {
+        DvZipStore {
+            out,
+            piece: Vec::with_capacity(DVZIP_PIECE),
+        }
+    }
+
+    fn flush_piece(&mut self) -> io::Result<()> {
+        let len = zlib_stored_len(self.piece.len() as u64) as u32;
+        self.out.write_all(&len.to_be_bytes())?;
+        write_zlib_stored(&mut self.out, &self.piece)?;
+        self.piece.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if !self.piece.is_empty() {
+            self.flush_piece()?;
+        }
+        self.out.flush()
+    }
+}
+
+impl<W: Write> Write for DvZipStore<W> {
+    fn write(&mut self, mut data: &[u8]) -> io::Result<usize> {
+        let len = data.len();
+        while !data.is_empty() {
+            let take = data.len().min(DVZIP_PIECE - self.piece.len());
+            self.piece.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.piece.len() == DVZIP_PIECE {
+                self.flush_piece()?;
+            }
+        }
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
+struct GzipStore<W: Write> {
+    out: W,
+    buf: Vec<u8>,
+    crc: flate2::Crc,
+    len: u64,
+}
+
+impl<W: Write> GzipStore<W> {
+    fn new(mut out: W) -> io::Result<Self> {
+        out.write_all(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff])?;
+        Ok(GzipStore {
+            out,
+            buf: Vec::with_capacity(65_535),
+            crc: flate2::Crc::new(),
+            len: 0,
+        })
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        write_stored_block(&mut self.out, &self.buf, true)?;
+        self.out.write_all(&self.crc.sum().to_le_bytes())?;
+        self.out.write_all(&(self.len as u32).to_le_bytes())?;
+        self.out.flush()
+    }
+}
+
+impl<W: Write> Write for GzipStore<W> {
+    fn write(&mut self, mut data: &[u8]) -> io::Result<usize> {
+        let len = data.len();
+        self.crc.update(data);
+        self.len += len as u64;
+        while !data.is_empty() {
+            let take = data.len().min(65_535 - self.buf.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buf.len() == 65_535 {
+                write_stored_block(&mut self.out, &self.buf, false)?;
+                self.buf.clear();
+            }
+        }
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// The odc archive written the way [`ArchiveWriter`] does, into `out`.
+fn write_cpio<W: Write>(out: &mut W, paths: &[PathBuf]) -> io::Result<()> {
+    let mut ino = 1u32;
+    let mut root = dir_entry(".", mtime(&std::fs::metadata(&paths[0])?));
+    root.ino = ino;
+    ino += 1;
+    out.write_all(&cpio::odc_header(&root))?;
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| invalid(format!("{} has no UTF-8 file name", path.display())))?;
+        RelPath::file_name(name).map_err(|e| invalid(e.to_string()))?;
+        let meta = std::fs::metadata(path)?;
+        if meta.is_dir() {
+            write_tree(out, path, &format!("./{name}"), &mut ino)?;
+        } else if meta.is_file() {
+            write_file(out, path, &format!("./{name}"), &meta, &mut ino)?;
+        } else {
+            return Err(invalid(format!(
+                "{} isn't a file or directory",
+                path.display()
+            )));
+        }
+    }
+    out.write_all(&cpio::odc_trailer())
+}
+
+fn write_file<W: Write>(
+    out: &mut W,
+    path: &Path,
+    name: &str,
+    meta: &std::fs::Metadata,
+    ino: &mut u32,
+) -> io::Result<()> {
+    if meta.len() > cpio::ODC_MAX_SIZE {
+        return Err(invalid(format!(
+            "{} is too large for an archive",
+            path.display()
+        )));
+    }
+    let mut entry = file_entry(name, meta.len(), 0, mtime(meta));
+    entry.ino = *ino;
+    *ino += 1;
+    out.write_all(&cpio::odc_header(&entry))?;
+    let mut file = File::open(path)?;
+    let mut left = meta.len();
+    let mut buf = vec![0; 64 << 10];
+    while left > 0 {
+        let n = file.read(&mut buf[..(left as usize).min(64 << 10)])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file shrank while sending",
+            ));
+        }
+        left -= n as u64;
+        out.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
+fn write_tree<W: Write>(
+    out: &mut W,
+    path: &Path,
+    name: &str,
+    ino: &mut u32,
+) -> io::Result<()> {
+    let mut entry = dir_entry(name, mtime(&std::fs::metadata(path)?));
+    entry.ino = *ino;
+    *ino += 1;
+    out.write_all(&cpio::odc_header(&entry))?;
+    let mut children: Vec<_> = std::fs::read_dir(path)?.collect::<Result<_, _>>()?;
+    children.sort_by_key(|c| c.file_name());
+    for child in children {
+        let Some(child_name) = child.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        if RelPath::file_name(&child_name).is_err() {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(child.path())?;
+        let child_path = format!("{name}/{child_name}");
+        if meta.is_dir() {
+            write_tree(out, &child.path(), &child_path, ino)?;
+        } else if meta.is_file() {
+            write_file(out, &child.path(), &child_path, &meta, ino)?;
+        }
+    }
+    Ok(())
+}
+
+/// A body streamed from a writer thread, so a large archive never touches a
+/// temporary file. The thread blocks on the pipe while the receiver is slow.
+fn spawn_stored_body(
+    paths: Vec<PathBuf>,
+    compressor: Compressor,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    let (tx, rx) = std::os::unix::net::UnixStream::pair()?;
+    std::thread::spawn(move || {
+        let out = std::io::BufWriter::new(tx);
+        let result = match compressor {
+            Compressor::DvZip => {
+                let mut store = DvZipStore::new(out);
+                write_cpio(&mut store, &paths).and_then(|()| store.finish())
+            }
+            Compressor::Gzip => GzipStore::new(out).and_then(|mut store| {
+                write_cpio(&mut store, &paths).and_then(|()| store.finish())
+            }),
+        };
+        if let Err(e) = result {
+            tracing::debug!("stored archive writer stopped: {e}");
+        }
+    });
+    rx.set_nonblocking(true)?;
+    Ok(rx)
 }
