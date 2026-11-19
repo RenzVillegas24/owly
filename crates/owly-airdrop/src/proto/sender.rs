@@ -73,6 +73,8 @@ pub struct Config {
     pub sender_id: String,
     pub bundle_id: String,
     pub ask_timeout: Duration,
+    /// How the upload body is prepared and sent.
+    pub upload: UploadMode,
 }
 
 impl Config {
@@ -83,6 +85,7 @@ impl Config {
             sender_id: sender_id.into(),
             bundle_id: "com.apple.finder".into(),
             ask_timeout: ASK_TIMEOUT,
+            upload: UploadMode::Auto,
         }
     }
 }
@@ -133,6 +136,59 @@ pub fn ask_request(config: &Config, transfer_id: &str, offer: &Offer) -> Vec<u8>
 }
 
 /// The `/Upload` head for a body of `len` bytes (UP-1a, UP-9, UP-10).
+/// How the body is put on the air.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UploadMode {
+    /// Compress small archives, stream stored ones above 512 MB.
+    #[default]
+    Auto,
+    /// Store and stream every archive: the upload starts at once.
+    Stream,
+    /// Compress every archive into a spool before asking.
+    Spool,
+    /// Stream archives whose files are already compressed, spool the rest.
+    TypeAware,
+    /// Compress and stream with `Transfer-Encoding: chunked` (experimental:
+    /// needs a receiver that accepts a body without `Content-Length`).
+    Chunked,
+}
+
+impl UploadMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "auto" => UploadMode::Auto,
+            "stream" => UploadMode::Stream,
+            "spool" => UploadMode::Spool,
+            "type" | "type-aware" => UploadMode::TypeAware,
+            "chunked" => UploadMode::Chunked,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            UploadMode::Auto => "auto",
+            UploadMode::Stream => "stream",
+            UploadMode::Spool => "spool",
+            UploadMode::TypeAware => "type",
+            UploadMode::Chunked => "chunked",
+        }
+    }
+}
+
+pub fn upload_head_chunked(transfer_id: &str, compressor: Compressor) -> Vec<u8> {
+    head(
+        Path::Upload,
+        &[
+            ("TransferID", transfer_id),
+            ("TotalBytes", "0"),
+            ("Content-Type", compressor.content_type()),
+            ("Connection", "keep-alive"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+    )
+}
+
 pub fn upload_head(transfer_id: &str, compressor: Compressor, len: u64) -> Vec<u8> {
     let len = len.to_string();
     head(
@@ -325,6 +381,8 @@ pub struct Transfer {
     transfer_id: String,
     is_url: bool,
     upload: Option<(Compressor, u64)>,
+    /// The body goes out chunked, without a `Content-Length`.
+    chunked: bool,
     reader: ResponseReader,
     actions: VecDeque<Action>,
 }
@@ -338,6 +396,26 @@ impl Transfer {
         offer: &Offer,
         upload: Option<(Compressor, u64)>,
     ) -> Self {
+        Self::build(config, transfer_id, offer, upload, false)
+    }
+
+    /// A file share whose body is compressed and streamed without a length.
+    pub fn new_chunked(
+        config: &Config,
+        transfer_id: &str,
+        offer: &Offer,
+        compressor: Compressor,
+    ) -> Self {
+        Self::build(config, transfer_id, offer, Some((compressor, 0)), true)
+    }
+
+    fn build(
+        config: &Config,
+        transfer_id: &str,
+        offer: &Offer,
+        upload: Option<(Compressor, u64)>,
+        chunked: bool,
+    ) -> Self {
         let is_url = matches!(offer, Offer::Urls(_));
         let actions = VecDeque::from([
             Action::Transmit(ask_request(config, transfer_id, offer)),
@@ -348,9 +426,15 @@ impl Transfer {
             transfer_id: transfer_id.into(),
             is_url,
             upload,
+            chunked,
             reader: ResponseReader::new(),
             actions,
         }
+    }
+
+    /// Whether the upload uses chunked framing.
+    pub fn is_chunked(&self) -> bool {
+        self.chunked
     }
 
     pub fn poll(&mut self) -> Option<Action> {
@@ -398,7 +482,11 @@ impl Transfer {
 
     /// Bytes the upload body will carry, once known.
     pub fn upload_size(&self) -> u64 {
-        self.upload.map_or(0, |(_, len)| len)
+        if self.chunked {
+            0
+        } else {
+            self.upload.map_or(0, |(_, len)| len)
+        }
     }
 
     /// The body is prepared: queue its upload head with the real length.
@@ -441,7 +529,12 @@ impl Transfer {
                 } else {
                     let (compressor, len) = self.upload.expect("a file share has an upload");
                     self.state = State::Uploading;
-                    if len == 0 {
+                    if self.chunked {
+                        self.actions.push_back(Action::SendUpload(upload_head_chunked(
+                            &self.transfer_id,
+                            compressor,
+                        )));
+                    } else if len == 0 {
                         // The body is still being prepared; the ask went out
                         // first so the receiver can prompt while it runs.
                         self.actions.push_back(Action::NeedUpload);

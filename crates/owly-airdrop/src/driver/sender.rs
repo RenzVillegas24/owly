@@ -27,7 +27,9 @@ use crate::proto::archive::cpio::{self, Entry};
 use crate::proto::archive::extract::RelPath;
 use crate::proto::mdns::{SUPPORTS_DVZIP, SUPPORTS_MIXED_TYPES, SUPPORTS_PIPELINING};
 use crate::proto::messages::{AskFile, Offer};
-use crate::proto::sender::{self, Action, Config, Outcome, Receiver, ResponseReader, Transfer};
+use crate::proto::sender::{
+    self, Action, Config, Outcome, Receiver, ResponseReader, Transfer, UploadMode,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -157,21 +159,33 @@ impl Sender {
             Payload::Urls(urls) => (Offer::Urls(urls.clone()), None, None),
             Payload::Files(paths) => {
                 let offer = offer(paths)?;
-                // Above half a gigabyte, deflating costs more than the radio
-                // will ever get back. Store the bytes and stream the archive
-                // straight from the files: no temporary file, and the upload
-                // starts as soon as the receiver accepts.
-                if offer_bytes(&offer) >= STORED_BODY_MIN {
-                    let cpio = cpio_len(paths)?;
-                    let len = stored_body_len(compressor, cpio);
-                    let reader = spawn_stored_body(paths.clone(), compressor)?;
-                    (offer, None, Some((reader, len)))
-                } else {
-                    let paths = paths.clone();
-                    let handle = tokio::task::spawn_blocking(move || {
-                        compress(&paths, compressor, Compression::fast())
-                    });
-                    (offer, Some(handle), None)
+                let plan = match self.config.upload {
+                    UploadMode::Auto if offer_bytes(&offer) >= STORED_BODY_MIN => BodyPlan::Stored,
+                    UploadMode::Auto => BodyPlan::Spool,
+                    UploadMode::Stream => BodyPlan::Stored,
+                    UploadMode::Spool => BodyPlan::Spool,
+                    UploadMode::TypeAware if all_compressed(paths) => BodyPlan::Stored,
+                    UploadMode::TypeAware => BodyPlan::Spool,
+                    UploadMode::Chunked => BodyPlan::Chunked,
+                };
+                match plan {
+                    BodyPlan::Stored => {
+                        let cpio = cpio_len(paths)?;
+                        let len = stored_body_len(compressor, cpio);
+                        let reader = spawn_stored_body(paths.clone(), compressor)?;
+                        (offer, None, Some((reader, len)))
+                    }
+                    BodyPlan::Spool => {
+                        let paths = paths.clone();
+                        let handle = tokio::task::spawn_blocking(move || {
+                            compress(&paths, compressor, Compression::fast())
+                        });
+                        (offer, Some(handle), None)
+                    }
+                    BodyPlan::Chunked => {
+                        let reader = spawn_compressed_body(paths.clone(), compressor)?;
+                        (offer, None, Some((reader, 0)))
+                    }
                 }
             }
         };
@@ -182,11 +196,16 @@ impl Sender {
         // A streamed body knows its length; a compressed one is still being
         // prepared, so a zero length asks the transfer for it with
         // `Action::NeedUpload` once the receiver accepts.
+        let chunked = matches!(&stream, Some((_, 0)));
         let body = match &stream {
             Some((_, len)) => Some((compressor, *len)),
             None => pending.as_ref().map(|_| (compressor, 0)),
         };
-        let mut transfer = Transfer::new(&self.config, &transfer_id, &offer, body);
+        let mut transfer = if chunked {
+            Transfer::new_chunked(&self.config, &transfer_id, &offer, compressor)
+        } else {
+            Transfer::new(&self.config, &transfer_id, &offer, body)
+        };
         let mut archive = match stream.take() {
             Some((reader, _)) => Some(Body::Stream(tokio::net::UnixStream::from_std(reader)?)),
             None => None,
@@ -274,7 +293,8 @@ impl Sender {
                     Action::SendUpload(head) => {
                         let body = archive.as_mut().expect("a file share has an archive");
                         let total = transfer.upload_size();
-                        match upload(tls, &head, body, total, events, cancel).await {
+                        let chunked = transfer.is_chunked();
+                        match upload(tls, &head, body, total, chunked, events, cancel).await {
                             Ok(()) => transfer.upload_sent(),
                             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                                 graceful_abort(tls).await;
@@ -353,6 +373,7 @@ async fn upload<S: AsyncWriteExt + Unpin>(
     head: &[u8],
     body: &mut Body,
     total: u64,
+    chunked: bool,
     events: Option<&mpsc::UnboundedSender<Event>>,
     cancel: &mut Option<watch::Receiver<bool>>,
 ) -> io::Result<()> {
@@ -364,13 +385,23 @@ async fn upload<S: AsyncWriteExt + Unpin>(
         if n == 0 {
             break;
         }
-        write(stream, &buf[..n], cancel).await?;
+        if chunked {
+            write(stream, format!("{n:x}\r\n").as_bytes(), cancel).await?;
+            write(stream, &buf[..n], cancel).await?;
+            write(stream, b"\r\n", cancel).await?;
+        } else {
+            write(stream, &buf[..n], cancel).await?;
+        }
         sent += n as u64;
-        if let Some(events) = events {
+        if total > 0
+            && let Some(events) = events
+        {
             let _ = events.send(Event::Progress(Progress { sent, total }));
         }
     }
-    if sent != total {
+    if chunked {
+        write(stream, b"0\r\n\r\n", cancel).await?;
+    } else if sent != total {
         return Err(io::Error::other(format!(
             "the body ended at {sent} of {total} bytes"
         )));
@@ -449,6 +480,51 @@ fn offer_bytes(offer: &Offer) -> u64 {
 /// Above this, the archive is stored and streamed instead of compressed into
 /// a temporary file.
 const STORED_BODY_MIN: u64 = 512 << 20;
+
+#[derive(Debug, Clone, Copy)]
+enum BodyPlan {
+    Spool,
+    Stored,
+    Chunked,
+}
+
+/// Extensions whose contents deflate barely or not at all.
+const COMPRESSED_EXTENSIONS: &[&str] = &[
+    "7z", "aab", "aac", "apk", "avi", "bin", "bz2", "dmg", "docx", "flac", "gif", "gz", "heic",
+    "heif", "ipa", "iso", "jar", "jpeg", "jpg", "m4a", "m4v", "mkv", "mov", "mp3", "mp4", "ogg",
+    "opus", "pdf", "png", "pptx", "rar", "webm", "webp", "xlsx", "xz", "zip", "zst",
+];
+
+fn all_compressed(paths: &[PathBuf]) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| COMPRESSED_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+}
+
+/// Compresses the archive straight into the pipe: no spool, no length.
+fn spawn_compressed_body(
+    paths: Vec<PathBuf>,
+    compressor: Compressor,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    let (tx, rx) = std::os::unix::net::UnixStream::pair()?;
+    std::thread::spawn(move || {
+        let mut writer = ArchiveWriter {
+            encoder: Encoder::new(compressor, Compression::fast()),
+            out: std::io::BufWriter::new(tx),
+            ino: 1,
+        };
+        let result = write_entries(&mut writer, &paths).and_then(|()| writer.finish());
+        if let Err(e) = result {
+            tracing::debug!("compressed archive writer stopped: {e}");
+        }
+    });
+    rx.set_nonblocking(true)?;
+    Ok(rx)
+}
 
 fn compressor(receiver_flags: u32) -> Compressor {
     let known = receiver_flags & (SUPPORTS_PIPELINING | SUPPORTS_MIXED_TYPES) != 0;
@@ -535,31 +611,35 @@ pub fn compress(
     compressor: Compressor,
     level: Compression,
 ) -> io::Result<(File, u64)> {
-    let mut items = Vec::new();
-    for path in paths {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| invalid(format!("{} has no UTF-8 file name", path.display())))?;
-        RelPath::file_name(name).map_err(|e| invalid(e.to_string()))?;
-        items.push((name.to_string(), path.clone()));
-    }
-    if items.is_empty() {
+    if paths.is_empty() {
         return Err(invalid("nothing to send".into()));
     }
-
     let mut spool = tempfile::tempfile()?;
     let mut writer = ArchiveWriter {
         encoder: Encoder::new(compressor, level),
         out: io::BufWriter::new(&mut spool),
         ino: 1,
     };
-    // UP-2a: the root entry first.
+    write_entries(&mut writer, paths)?;
+    writer.finish()?;
+    let len = spool.stream_position()?;
+    spool.rewind()?;
+    Ok((spool, len))
+}
+
+/// The entries of the archive: the root directory, then every item, exactly
+/// as [`ArchiveWriter`] would write them.
+fn write_entries<W: Write>(writer: &mut ArchiveWriter<W>, paths: &[PathBuf]) -> io::Result<()> {
     writer.entry(
-        &dir_entry(".", mtime(&std::fs::metadata(&items[0].1)?)),
+        &dir_entry(".", mtime(&std::fs::metadata(&paths[0])?)),
         None,
     )?;
-    for (name, path) in &items {
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| invalid(format!("{} has no UTF-8 file name", path.display())))?;
+        RelPath::file_name(name).map_err(|e| invalid(e.to_string()))?;
         let meta = std::fs::metadata(path)?;
         if meta.is_dir() {
             writer.tree(path, &format!("./{name}"))?;
@@ -572,10 +652,7 @@ pub fn compress(
             )));
         }
     }
-    writer.finish()?;
-    let len = spool.stream_position()?;
-    spool.rewind()?;
-    Ok((spool, len))
+    Ok(())
 }
 
 /// Builds the offer and the archive together. Kept for callers that want the
