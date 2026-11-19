@@ -660,7 +660,11 @@ pub struct Found {
 pub enum BrowseEvent {
     /// A receiver resolved, or its address, port or flags changed.
     Found(Found),
-    /// Its announcement was withdrawn or expired.
+    /// It announced a goodbye (`TTL 0`): it is leaving on purpose.
+    Withdrawn(String),
+    /// It stopped being announced or its records expired. On a lossy link
+    /// this also happens while the receiver is still there, so a host should
+    /// allow a grace period before hiding it.
     Lost(String),
 }
 
@@ -683,6 +687,8 @@ struct Instance {
     srv: Option<Cached<(Name, u16)>>,
     txt: Option<Cached<Txt>>,
     reported: Option<Found>,
+    /// The last PTR was a goodbye (TTL 0), not an expiry.
+    withdrawn: bool,
 }
 
 /// Most instances and hosts tracked, so a flood of announcements can't grow
@@ -800,6 +806,7 @@ impl Browser {
                     };
                     if let Some(i) = self.instance(label) {
                         i.ptr = Some(expires(r.ttl));
+                        i.withdrawn = r.ttl == 0;
                     }
                 }
                 RData::Srv { port, target, .. } => {
@@ -901,7 +908,12 @@ impl Browser {
                     i.reported = resolved;
                 }
                 (None, Some(_)) if !alive => {
-                    events.push_back(BrowseEvent::Lost(label.clone()));
+                    let event = if i.withdrawn {
+                        BrowseEvent::Withdrawn(label.clone())
+                    } else {
+                        BrowseEvent::Lost(label.clone())
+                    };
+                    events.push_back(event);
                     i.reported = None;
                 }
                 _ => {}
@@ -1110,7 +1122,7 @@ mod tests {
         b.handle(&bye, start);
         assert_eq!(b.poll_event(), None);
         b.on_timer(start + Duration::from_secs(2));
-        assert_eq!(b.poll_event(), Some(BrowseEvent::Lost(s.instance)));
+        assert_eq!(b.poll_event(), Some(BrowseEvent::Withdrawn(s.instance)));
     }
 
     // spec: NET-2, SEC-11
