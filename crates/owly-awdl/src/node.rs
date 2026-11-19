@@ -97,6 +97,8 @@ pub struct Config {
     pub addr: MacAddr,
     /// The host name for the ARPA TLV.
     pub name: String,
+    /// The device class in the Version TLV: what a peer shows for us.
+    pub devclass: u8,
     pub radio: RadioConstraints,
     /// The data rate towards peers that receive it (see [`TxRate::for_peer`]).
     pub rate: TxRate,
@@ -129,6 +131,7 @@ impl Config {
         Config {
             addr,
             name: name.into(),
+            devclass: tlv::devclass::MACOS,
             radio,
             rate: TxRate::BASIC,
             no_ack,
@@ -162,8 +165,6 @@ pub struct Stats {
     pub peers_evicted: u64,
 }
 
-/// Announced in the Version TLV: macOS, as legacy announced.
-const DEVCLASS: u8 = tlv::devclass::MACOS;
 /// What the HT Capabilities TLV announces.
 const HT: HtCapabilities = HtCapabilities::ONE_STREAM;
 /// PSFs every 110 TU (§3.2).
@@ -691,7 +692,7 @@ impl Node {
         let own = Own {
             addr: self.cfg.addr,
             name: &self.cfg.name,
-            devclass: DEVCLASS,
+            devclass: self.cfg.devclass,
             channel: self.cfg.radio.channel.0,
             master_channel: self.cfg.radio.channel,
             next_tu: self.clock.next_slot_tu(now),
