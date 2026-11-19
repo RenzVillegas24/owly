@@ -286,6 +286,121 @@ pub fn parse_version(value: &[u8]) -> Result<(u8, u8), Error> {
     Ok((b.u8(0)?, b.u8(1)?))
 }
 
+/// The `dnm=` string anywhere in `bytes`, for frames whose enclosing layout
+/// isn't known yet (docs/open-questions.md, item 11). The value is the
+/// printable run after the prefix, bounded to [`NAME_MAX`].
+pub fn find_dnm(bytes: &[u8]) -> Option<String> {
+    const NEEDLE: &[u8] = b"dnm=";
+    let at = bytes
+        .windows(NEEDLE.len())
+        .position(|w| w == NEEDLE)?
+        .checked_add(NEEDLE.len())?;
+    let rest = &bytes[at..];
+    let len = rest
+        .iter()
+        .take(NAME_MAX)
+        .take_while(|b| (0x20..0x7f).contains(*b))
+        .count();
+    if len == 0 {
+        return None;
+    }
+    let name = String::from(String::from_utf8_lossy(&rest[..len]).trim());
+    (!name.is_empty()).then_some(name)
+}
+
+/// The AirDrop name in a Service Response TLV (2), if it carries one.
+///
+/// The value starts with the `_airdrop._tcp` service ID, then records, one of
+/// which holds the DNS-SD TXT data with `dnm=`. That string is the name the
+/// AirDrop sheet shows; iOS advertises a UUID as its host name instead, so
+/// this is the only place the name exists. Bounds-checked throughout: a
+/// malformed value yields `None` rather than an error, since peers keep
+/// announcing without a name.
+pub fn parse_service_name(value: &[u8]) -> Option<String> {
+    const AIRDROP_SERVICE: [u8; 4] = [0x7f, 0x00, 0x17, 0xf2];
+    let start = value
+        .windows(4)
+        .position(|w| w == AIRDROP_SERVICE)
+        .unwrap_or(0);
+    let body = &value[start..];
+    if body.len() >= 16 && body[4] == 0x08 {
+        let mut i = 16usize;
+        while i + 3 <= body.len() {
+            let kind = body[i];
+            let len = u16::from_le_bytes([body[i + 1], body[i + 2]]) as usize;
+            let start = i + 3;
+            let Some(end) = start.checked_add(len) else {
+                break;
+            };
+            if end > body.len() {
+                break;
+            }
+            if kind == 2 {
+                if let Some(name) = name_from_records(&body[start..end]) {
+                    return Some(name);
+                }
+            }
+            i = end;
+        }
+    }
+    // The record layout isn't settled (docs/open-questions.md item 11); take
+    // the TXT string verbatim when it's there.
+    find_dnm(value)
+}
+
+/// Walks the DNS-SD records of a Service Response record block: name length,
+/// name, type, class, data length, data. TXT records (type 16) are searched
+/// for `dnm=`.
+fn name_from_records(value: &[u8]) -> Option<String> {
+    let mut pos = 0usize;
+    while pos + 5 <= value.len() {
+        let name_len = u16::from_le_bytes([value[pos], value[pos + 1]]) as usize;
+        if name_len < 3 {
+            return None;
+        }
+        let type_pos = pos + 2 + name_len - 1;
+        if type_pos + 3 > value.len() {
+            return None;
+        }
+        let rtype = value[type_pos];
+        let data_len = u16::from_be_bytes([value[type_pos + 1], value[type_pos + 2]]) as usize;
+        let data_start = type_pos + 5;
+        let data_end = data_start.checked_add(data_len)?;
+        if data_end > value.len() {
+            return None;
+        }
+        if rtype == 16 {
+            if let Some(name) = name_in_txt(&value[data_start..data_end]) {
+                return Some(name);
+            }
+        }
+        pos = data_end;
+    }
+    None
+}
+
+/// The `dnm=` string of a TXT record, as DNS-SD writes it: length-prefixed
+/// strings.
+fn name_in_txt(txt: &[u8]) -> Option<String> {
+    let mut i = 0usize;
+    while i < txt.len() {
+        let len = txt[i] as usize;
+        i += 1;
+        if i + len > txt.len() {
+            return None;
+        }
+        let string = &txt[i..i + len];
+        i += len;
+        if let Some(name) = string.strip_prefix(b"dnm=") {
+            let name = String::from(String::from_utf8_lossy(name).trim());
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
 /// What one action frame's TLVs say, decoded whole before anything acts on
 /// them, so a malformed TLV late in the frame can't half-update a peer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -296,6 +411,10 @@ pub struct Advert {
     pub election_v2: bool,
     pub sequence: Option<Sequence>,
     pub name: Option<String>,
+    /// The AirDrop name from a Service Response TLV (2), when the frame has
+    /// one. iOS puts a UUID in its host name, so `dnm=` here is the name the
+    /// AirDrop sheet shows.
+    pub service_name: Option<String>,
     /// Version, device class.
     pub version: Option<(u8, u8)>,
     pub ht: Option<HtCapabilities>,
@@ -323,6 +442,7 @@ impl Advert {
                 }
                 kind::CHANNEL_SEQUENCE => a.sequence = Some(Sequence::parse(value)?),
                 kind::ARPA => a.name = Some(parse_arpa(value)?),
+                kind::SERVICE_RESPONSE => a.service_name = parse_service_name(value),
                 kind::VERSION => a.version = Some(parse_version(value)?),
                 kind::HT_CAPABILITIES => a.ht = Some(HtCapabilities::parse(value)?),
                 kind::DATA_PATH_STATE => a.data_path = Some(DataPathState::parse(value)?),
@@ -651,5 +771,41 @@ mod tests {
         let t = tlvs(&out).next().unwrap().unwrap();
         assert_eq!(parse_arpa(t.value).unwrap().len(), NAME_MAX);
         assert_eq!(parse_arpa(&[3, 10, b'a']), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn the_airdrop_name_comes_from_the_service_response() {
+        let txt = b"dnm=Test iPhone";
+        let mut record = Vec::new();
+        record.extend_from_slice(&3u16.to_le_bytes()); // name length, type byte included
+        record.extend_from_slice(b"ab");
+        record.push(16); // TXT
+        record.extend_from_slice(&((txt.len() + 1) as u16).to_be_bytes());
+        record.extend_from_slice(&[0, 1]); // class
+        record.push(txt.len() as u8);
+        record.extend_from_slice(txt);
+
+        let mut value = Vec::new();
+        value.extend_from_slice(&[0x7f, 0x00, 0x17, 0xf2, 0x08]);
+        value.resize(16, 0);
+        value.push(2);
+        value.extend_from_slice(&(record.len() as u16).to_le_bytes());
+        value.extend_from_slice(&record);
+
+        assert_eq!(parse_service_name(&value).as_deref(), Some("Test iPhone"));
+        // Truncation anywhere is a miss, never a panic.
+        for len in 0..value.len() {
+            let _ = parse_service_name(&value[..len]);
+        }
+        assert_eq!(parse_service_name(&[0x7f, 0x00, 0x17, 0xf2]), None);
+    }
+
+    #[test]
+    fn a_dnm_string_is_found_wherever_it_rides() {
+        let mut frame = vec![0u8; 30];
+        frame.extend_from_slice(b"\x0ednm=Test iPhone\x00");
+        assert_eq!(find_dnm(&frame).as_deref(), Some("Test iPhone"));
+        assert_eq!(find_dnm(b"nothing here"), None);
+        assert_eq!(find_dnm(b"dnm=\x01"), None);
     }
 }

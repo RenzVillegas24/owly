@@ -416,6 +416,8 @@ pub fn service_id(random: [u8; 6]) -> String {
 pub struct Service {
     /// The service ID, the instance name (MDNS-1, MDNS-3).
     pub instance: String,
+    /// The receiver's display name, published as `dnm=` in the TXT record.
+    pub name: String,
     /// The host label; the SRV target is `<host>.local.`.
     pub host: String,
     pub port: u16,
@@ -455,7 +457,13 @@ impl Service {
                 rtype: rtype::TXT,
                 cache_flush: true,
                 ttl: OTHER_TTL,
-                data: RData::Txt(vec![format!("flags={}", self.flags).into_bytes()]),
+                data: RData::Txt({
+                    let mut strings = vec![format!("flags={}", self.flags).into_bytes()];
+                    if !self.name.is_empty() {
+                        strings.push(format!("dnm={}", self.name).into_bytes());
+                    }
+                    strings
+                }),
             },
             Record {
                 name: host,
@@ -638,6 +646,10 @@ pub struct Reply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
     pub instance: String,
+    /// The receiver's advertised name (`dnm=` in its TXT record), empty when
+    /// it didn't send one. This is the name the AirDrop sheet shows; the SRV
+    /// host name is not it (iOS uses a UUID there).
+    pub name: String,
     pub host: String,
     pub port: u16,
     pub addr: Ipv6Addr,
@@ -658,11 +670,18 @@ struct Cached<T> {
     expires: Instant,
 }
 
+/// What a receiver's TXT record says that a browser keeps (MDNS-5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Txt {
+    flags: u32,
+    name: String,
+}
+
 #[derive(Debug, Default)]
 struct Instance {
     ptr: Option<Instant>,
     srv: Option<Cached<(Name, u16)>>,
-    txt: Option<Cached<u32>>,
+    txt: Option<Cached<Txt>>,
     reported: Option<Found>,
 }
 
@@ -798,19 +817,20 @@ impl Browser {
                     let Some(label) = r.name.instance_label() else {
                         continue;
                     };
-                    let flags = strings
-                        .iter()
-                        .find_map(|s| {
-                            std::str::from_utf8(s)
-                                .ok()?
-                                .strip_prefix("flags=")?
-                                .parse()
-                                .ok()
-                        })
-                        .unwrap_or(0);
+                    let mut txt = Txt::default();
+                    for s in strings {
+                        let Ok(s) = std::str::from_utf8(s) else {
+                            continue;
+                        };
+                        if let Some(value) = s.strip_prefix("flags=") {
+                            txt.flags = value.parse().unwrap_or(0);
+                        } else if let Some(value) = s.strip_prefix("dnm=") {
+                            txt.name = value.to_string();
+                        }
+                    }
                     if let Some(i) = self.instance(label) {
                         i.txt = Some(Cached {
-                            value: flags,
+                            value: txt,
                             expires: expires(r.ttl),
                         });
                     }
@@ -863,10 +883,15 @@ impl Browser {
                     let (_, addr) = hosts.iter().find(|(h, _)| h == target)?;
                     Some(Found {
                         instance: label.clone(),
+                        name: i
+                            .txt
+                            .as_ref()
+                            .map(|c| c.value.name.clone())
+                            .unwrap_or_default(),
                         host: target.0.first().cloned().unwrap_or_default(),
                         port: *port,
                         addr: addr.value,
-                        flags: i.txt.as_ref().map_or(0, |c| c.value),
+                        flags: i.txt.as_ref().map_or(0, |c| c.value.flags),
                     })
                 })
                 .flatten();
@@ -955,6 +980,7 @@ mod tests {
     fn service() -> Service {
         Service {
             instance: "3fa9c01b22de".into(),
+            name: "Test Phone".into(),
             host: "owly-3fa9c01b22de".into(),
             port: 8770,
             addr: "fe80::1".parse().unwrap(),
@@ -1005,7 +1031,10 @@ mod tests {
         assert!(
             matches!(&records[1].data, RData::Srv { port: 8770, target, .. } if target.to_string() == "owly-3fa9c01b22de.local.")
         );
-        assert_eq!(records[2].data, RData::Txt(vec![b"flags=137".to_vec()]));
+        assert_eq!(
+            records[2].data,
+            RData::Txt(vec![b"flags=137".to_vec(), b"dnm=Test Phone".to_vec()])
+        );
         assert_eq!(records[3].data, RData::Aaaa("fe80::1".parse().unwrap()));
         assert_ne!(
             RECEIVER_FLAGS & (SUPPORTS_PIPELINING | SUPPORTS_MIXED_TYPES),
@@ -1069,6 +1098,7 @@ mod tests {
             b.poll_event(),
             Some(BrowseEvent::Found(Found {
                 instance: s.instance.clone(),
+                name: "Test Phone".into(),
                 host: s.host.clone(),
                 port: 8770,
                 addr: s.addr,

@@ -466,6 +466,9 @@ impl Node {
         };
         self.stats.rx_data += 1;
         let src = header.src;
+        // The AirDrop name rides in the service records iOS sends with its
+        // data frames; the mDNS TXT it answers with carries only flags.
+        let discovered_name = tlv::find_dnm(body);
         let peer = self.peers.get_mut(&src);
         let (known, valid) = match peer {
             Some(p) => {
@@ -473,6 +476,9 @@ impl Node {
                 // transfer can go seconds between the action frames we hear
                 // (patch `owl-07`).
                 p.last_seen = now;
+                if let Some(name) = discovered_name {
+                    p.name = name;
+                }
                 (true, p.valid)
             }
             None => (false, false),

@@ -11,7 +11,7 @@ use crate::{MacAddr, Time};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
     pub mac: MacAddr,
-    /// From its ARPA TLV.
+    /// From its Service Response TLV's `dnm=`, else its ARPA TLV.
     pub name: String,
     pub version: u8,
     pub devclass: u8,
@@ -84,7 +84,12 @@ impl Peer {
     /// parameters, which the node reads against its own clock. Returns
     /// whether it has just turned valid.
     pub(crate) fn absorb(&mut self, a: &Advert, mif: bool) -> bool {
-        if let Some(name) = &a.name {
+        // The AirDrop name from the service response is the one a user
+        // recognises; the ARPA host name is iOS's UUID. Fall back to ARPA for
+        // peers that never send a service response.
+        if let Some(name) = &a.service_name {
+            self.name.clone_from(name);
+        } else if let Some(name) = &a.name {
             self.name.clone_from(name);
         }
         if let Some((version, devclass)) = a.version {
