@@ -167,6 +167,22 @@ impl ElectionParams {
     }
 }
 
+/// The VHT Capabilities TLV (17): an IEEE 802.11 VHT Capabilities element
+/// (element 191): four bytes of capabilities, then the MCS/NSS map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VhtCapabilities {
+    pub info: u32,
+    pub mcs: [u8; 8],
+}
+
+impl VhtCapabilities {
+    /// 80 MHz, two streams, MCS 0-9: what the WCN3990 can receive.
+    pub const VHT80_2SS: VhtCapabilities = VhtCapabilities {
+        info: 0x0380_0036,
+        mcs: [0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff],
+    };
+}
+
 /// The HT Capabilities TLV (7): two reserved bytes, the HT capability
 /// word, the A-MPDU parameters, the RX MCS mask, two reserved bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +199,22 @@ impl HtCapabilities {
         capabilities: 0x11ce,
         ampdu_params: 0x1b,
         rx_mcs: 0xff,
+    };
+
+    /// Two spatial streams on 20 MHz only: an experiment to see whether the
+    /// iPhone sends 2SS unicast to a peer that advertises it without asking
+    /// for 40 MHz frames the 20 MHz monitor cannot see.
+    pub const TWO_STREAM_20: HtCapabilities = HtCapabilities {
+        capabilities: 0x11cc,
+        ampdu_params: 0x1b,
+        rx_mcs: 0xffff,
+    };
+
+    /// Two spatial streams on 20/40 MHz.
+    pub const TWO_STREAM: HtCapabilities = HtCapabilities {
+        capabilities: 0x11ce,
+        ampdu_params: 0x1b,
+        rx_mcs: 0xffff,
     };
 
     /// The mask may be longer than one byte; bits past MCS 31 are
@@ -472,6 +504,7 @@ pub struct Own<'a> {
     pub sequence: &'a Sequence,
     pub election: &'a crate::election::Election,
     pub ht: Option<HtCapabilities>,
+    pub vht: Option<VhtCapabilities>,
 }
 
 fn tlv(out: &mut Vec<u8>, kind: u8, value: impl FnOnce(&mut Vec<u8>)) {
@@ -560,12 +593,22 @@ pub fn put_service_params(out: &mut Vec<u8>) {
     });
 }
 
+pub fn put_vht_capabilities(out: &mut Vec<u8>, vht: &VhtCapabilities) {
+    tlv(out, kind::IEEE80211_CONTAINER, |v| {
+        v.u8(0xbf); // element 191: VHT Capabilities
+        v.u8(12);
+        v.le32(vht.info);
+        v.extend_from_slice(&vht.mcs);
+    });
+}
+
 pub fn put_ht_capabilities(out: &mut Vec<u8>, ht: &HtCapabilities) {
     tlv(out, kind::HT_CAPABILITIES, |v| {
         v.le16(0);
         v.le16(ht.capabilities);
         v.u8(ht.ampdu_params);
-        v.u8(ht.rx_mcs as u8);
+        // One byte per eight MCS, as the spec allows: two streams need two.
+        v.extend_from_slice(&(ht.rx_mcs as u16).to_le_bytes());
         v.le16(0);
     });
 }
@@ -620,6 +663,9 @@ pub fn put_all(out: &mut Vec<u8>, own: &Own, mif: bool) {
         put_ht_capabilities(out, ht);
     }
     if mif {
+        if let Some(vht) = &own.vht {
+            put_vht_capabilities(out, vht);
+        }
         put_arpa(out, own.name);
     }
     put_data_path_state(out, own);
@@ -653,6 +699,7 @@ mod tests {
             sequence: &seq,
             election: &e,
             ht: Some(HtCapabilities::ONE_STREAM),
+            vht: None,
         };
         let mut out = Vec::new();
         put_all(&mut out, &own, mif);

@@ -19,7 +19,7 @@ use crate::ip::Ipv6Packet;
 use crate::peer::{Peer, PeerInfo};
 use crate::rate::TxRate;
 use crate::sync::{Clock, MULTICAST_GUARD_US, SLOT_US, UNICAST_GUARD_US};
-use crate::tlv::{self, Advert, HtCapabilities, Own};
+use crate::tlv::{self, Advert, HtCapabilities, Own, VhtCapabilities};
 use crate::{MacAddr, TU, Time};
 
 /// What a node is given.
@@ -115,6 +115,11 @@ pub struct Config {
     pub amsdu: bool,
     /// The largest frame the radio takes, MAC header included.
     pub max_frame: usize,
+    /// The HT capabilities to announce: one or two streams.
+    pub ht: HtCapabilities,
+    /// The VHT capabilities to announce on MIFs, when the monitor can
+    /// receive the matching 80 MHz frames.
+    pub vht: Option<VhtCapabilities>,
     /// Peers heard more weakly than this, in dBm, aren't taken on; known
     /// ones are kept down to 5 dB below. `None` takes any.
     pub rssi_threshold: Option<i8>,
@@ -138,6 +143,8 @@ impl Config {
             accept_addba: false,
             amsdu: false,
             max_frame: 2304,
+            ht: HtCapabilities::ONE_STREAM,
+            vht: None,
             rssi_threshold: Some(-65),
             neighbour_echo: true,
             max_peers: MAX_PEERS,
@@ -166,7 +173,6 @@ pub struct Stats {
 }
 
 /// What the HT Capabilities TLV announces.
-const HT: HtCapabilities = HtCapabilities::ONE_STREAM;
 /// PSFs every 110 TU (§3.2).
 const PSF_INTERVAL_TU: u16 = 110;
 /// Peers unheard for this long are dropped: 5 s, as legacy patch `owl-07`
@@ -700,7 +706,8 @@ impl Node {
             psf_interval_tu: PSF_INTERVAL_TU,
             sequence: &self.sequence,
             election: &self.election,
-            ht: Some(HT),
+            ht: Some(self.cfg.ht),
+            vht: self.cfg.vht,
         };
         let mif = subtype == frame::subtype::MIF;
         let bytes = frame::action_frame(self.cfg.addr, seq, subtype, now.micros() as u32, |out| {

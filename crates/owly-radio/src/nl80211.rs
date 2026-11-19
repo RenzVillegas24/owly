@@ -36,6 +36,8 @@ const ATTR_SUPPORTED_IFTYPES: u16 = 32;
 const ATTR_REG_ALPHA2: u16 = 33;
 const ATTR_WIPHY_FREQ: u16 = 38;
 const ATTR_WIPHY_CHANNEL_TYPE: u16 = 39;
+const ATTR_CHANNEL_WIDTH: u16 = 159;
+const ATTR_CENTER_FREQ1: u16 = 160;
 const ATTR_SSID: u16 = 52;
 const ATTR_FREQ_FIXED: u16 = 60;
 const ATTR_INTERFACE_COMBINATIONS: u16 = 120;
@@ -418,6 +420,23 @@ impl Nl80211 {
         a.u32(ATTR_IFINDEX, ifindex)
             .u32(ATTR_WIPHY_FREQ, freq)
             .u32(ATTR_WIPHY_CHANNEL_TYPE, CHAN_HT20);
+        self.genl.request(CMD_SET_WIPHY, 0, &a).map(drop)
+    }
+
+    /// Sets a channel and its width on an interface. `width` is nl80211's
+    /// `NL80211_CHAN_WIDTH_*` (3 is 80 MHz); 80 MHz also needs the center.
+    pub fn set_freq_width(
+        &mut self,
+        ifindex: u32,
+        freq: u32,
+        width: u32,
+        center: u32,
+    ) -> io::Result<()> {
+        let mut a = Attrs::new();
+        a.u32(ATTR_IFINDEX, ifindex)
+            .u32(ATTR_WIPHY_FREQ, freq)
+            .u32(ATTR_CHANNEL_WIDTH, width)
+            .u32(ATTR_CENTER_FREQ1, center);
         self.genl.request(CMD_SET_WIPHY, 0, &a).map(drop)
     }
 
